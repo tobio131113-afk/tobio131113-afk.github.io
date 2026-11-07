@@ -147,7 +147,12 @@
   .stage .stage-empty{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     color:var(--muted2);font-size:14px;text-align:center;padding:16px;
+    /* 送信停止後にビデオ要素側に残る最後のフレームや「1.00」のような
+       残骸表示を覆い隠すため、空表示の間は不透明な黒で stage 全体を覆う */
+    background:#000;z-index:3;
   }
+  .hud{z-index:4}
+  .stage-tools{z-index:4}
   .stage .stage-empty.hide{display:none}
   .hud{
     position:absolute;left:10px;top:10px;display:none;flex-wrap:wrap;gap:6px;max-width:calc(100% - 20px);
@@ -359,13 +364,13 @@
 
   /* ================= 設定 ================= */
   var PEER_PREFIX = 'smgh-v1-';
-  // 発信側・受信側の両方が newPeer() 経由でこの同一 config を使う。
+  // 発信側・受信側の両方が buildIceConfig() 経由で同一の作り方の config を使う。
   // TURN は UDP が塞がれた回線でも届くよう、80/443 の UDP・TCP と
   // TLS(turns:443) をすべて入れる。
   var TURN_AUTH = { username: 'openrelayproject', credential: 'openrelayproject' };
   function turnServer(url){ var o = { urls: url }; o.username = TURN_AUTH.username; o.credential = TURN_AUTH.credential; return o; }
-  var ICE_CONFIG = {
-    iceServers: [
+  function fixedIceServers(){
+    return [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
@@ -374,9 +379,67 @@
       turnServer('turn:openrelay.metered.ca:443'),
       turnServer('turn:openrelay.metered.ca:443?transport=tcp'),
       turnServer('turns:openrelay.metered.ca:443?transport=tcp')
-    ],
-    iceCandidatePoolSize: 10
-  };
+    ];
+  }
+  /* ---- Metered 静的認証エンドポイント向け「期限付き認証情報」 ----
+     別々のインターネット同士では中継（TURN）頼みになるため、固定認証の
+     openrelay.metered.ca に加えて、静的認証エンドポイント
+     staticauth.openrelay.metered.ca 向けの期限付き認証情報も毎回生成する。
+     username = 現在時刻+3600秒のUNIXタイムスタンプ文字列
+     credential = Base64(HMAC-SHA1(key="openrelayprojectsecret", message=username))
+     生成は WebCrypto（crypto.subtle）で行い、秘密鍵自体は公開されている
+     openrelay プロジェクト用のものを使う。 */
+  var STATIC_TURN_SECRET = 'openrelayprojectsecret';
+  var STATIC_TURN_TTL_SEC = 3600;
+  function staticTurnServer(url, auth){
+    var o = { urls: url };
+    o.username = auth.username;
+    o.credential = auth.credential;
+    return o;
+  }
+  function staticTurnServers(auth){
+    if (!auth) return [];
+    return [
+      staticTurnServer('turn:staticauth.openrelay.metered.ca:80', auth),
+      staticTurnServer('turn:staticauth.openrelay.metered.ca:80?transport=tcp', auth),
+      staticTurnServer('turn:staticauth.openrelay.metered.ca:443', auth),
+      staticTurnServer('turn:staticauth.openrelay.metered.ca:443?transport=tcp', auth),
+      staticTurnServer('turns:staticauth.openrelay.metered.ca:443', auth)
+    ];
+  }
+  function bufferToBase64(buf){
+    var bytes = new Uint8Array(buf), bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return window.btoa(bin);
+  }
+  // 期限付き認証情報を新しく生成する。WebCrypto が使えない環境では null
+  // （その場合は固定認証エントリだけで接続を試みる）。
+  function generateStaticTurnAuth(){
+    var username = String(Math.floor(Date.now() / 1000) + STATIC_TURN_TTL_SEC);
+    if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
+      return Promise.resolve(null);
+    }
+    var enc = new window.TextEncoder();
+    return window.crypto.subtle.importKey(
+      'raw', enc.encode(STATIC_TURN_SECRET), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+    ).then(function(key){
+      return window.crypto.subtle.sign('HMAC', key, enc.encode(username));
+    }).then(function(sig){
+      return { username: username, credential: bufferToBase64(sig) };
+    }).catch(function(){ return null; });
+  }
+  // Peer 生成・再接続（作り直し）のたびに呼び、期限付き認証情報を
+  // 新しく生成したうえで iceServers に含めた config を返す。
+  function buildIceConfig(){
+    return generateStaticTurnAuth().then(function(auth){
+      return {
+        iceServers: fixedIceServers().concat(staticTurnServers(auth)),
+        iceCandidatePoolSize: 10
+      };
+    }).catch(function(){
+      return { iceServers: fixedIceServers(), iceCandidatePoolSize: 10 };
+    });
+  }
   var QUALITY = {
     text:     { bitrate: 3500000, hint: 'text',   label: '文字優先' },
     balanced: { bitrate: 3000000, hint: 'detail', label: 'バランス' },
@@ -395,10 +458,15 @@
   // 送信側
   var sendPeer = null, sendCall = null, sendConn = null, localStream = null, sendStatsTimer = null;
   var sending = false, sendDiag = null;
+  var sendSignalRetry = 0, sendCallStarted = false, sendRetryTimer = null;
   var sendIceConnected = false, sendIceFailed = false;
+  var sendDiscRetry = 0, sendDiscTimer = null;
 
   // 受信側
   var recvPeer = null, recvCall = null, recvConn = null, recvCode = null, recvRetry = 0;
+  var recvSignalRetry = 0, recvRetryTimer = null;
+  var recvDiscRetry = 0, recvDiscTimer = null;
+  var recvGen = 0; // Peer生成の世代。作り直し・リセット時に古い生成結果を捨てるため
   var remoteStream = null, recvStatsTimer = null, wakeLock = null, recvDiag = null;
   var recvIceConnected = false, recvIceFailed = false, recvStreamSeen = false, recvWatchdog = null;
 
@@ -482,16 +550,30 @@
   function peerJsReady(){
     return typeof window.Peer !== 'undefined';
   }
-  function newPeer(id){
+  function newPeerWithConfig(id, iceConfig){
     var opts = {
       host: '0.peerjs.com',
       port: 443,
       path: '/',
       secure: true,
       debug: 0,
-      config: ICE_CONFIG
+      config: iceConfig
     };
     return id ? new window.Peer(id, opts) : new window.Peer(opts);
+  }
+  // Peer の生成は必ずここを通す。呼ぶたびに buildIceConfig() で
+  // 期限付きTURN認証情報を新しく生成するので、初回生成だけでなく
+  // シグナリング再試行での作り直しのたびに新しい認証情報になる。
+  function newPeerAsync(id, cb){
+    buildIceConfig().then(function(iceConfig){
+      var peer = null;
+      try { peer = newPeerWithConfig(id, iceConfig); } catch (e) { peer = null; }
+      cb(peer);
+    }).catch(function(){
+      var peer = null;
+      try { peer = newPeerWithConfig(id, { iceServers: fixedIceServers(), iceCandidatePoolSize: 10 }); } catch (e) { peer = null; }
+      cb(peer);
+    });
   }
   function peerErrorText(err){
     var t = err && err.type ? err.type : '';
@@ -505,6 +587,48 @@
       case 'ssl-unavailable':  return '安全な接続（HTTPS）が使えません。httpsのURLで開いてください。';
       default: return '接続でエラーが発生しました' + (t ? '（' + t + '）' : '') + '。最初からやり直してください。';
     }
+  }
+
+  /* ================= プレビューの残骸表示クリア =================
+     停止・失敗のあと、ビデオ要素や統計欄に最後のフレームや
+     「1.00」のような数値の残骸が残ることがある。プレビューを
+     空に戻すときは、映像・統計・HUDをまとめて初期表示に戻す。
+     ※ ICE診断（候補の内訳）は失敗時の切り分け材料なのでここでは消さない。
+       診断を消すのは「最初からやり直す」での完全リセット時だけ。 */
+  function clearVideoEl(v){
+    if (!v) return;
+    try { v.pause(); } catch (e) {}
+    try { v.srcObject = null; } catch (e) {}
+    try { v.removeAttribute('src'); } catch (e) {}
+    try { v.load(); } catch (e) {} // 最後に映ったフレームの残像を消す
+  }
+  function resetSendPreviewStats(){
+    $('sendRoute').textContent = '—';
+    $('sendFps').textContent = '—';
+    $('sendRtt').textContent = '—';
+    $('sendRes').textContent = '—';
+  }
+  function resetRecvPreviewStats(){
+    $('recvRoute').textContent = '—';
+    $('recvFps').textContent = '—';
+    $('recvRtt').textContent = '—';
+    $('recvRes').textContent = '—';
+    $('hudRoute').textContent = '経路：—';
+    $('hudFps').textContent = '— fps';
+    $('hudRtt').textContent = '遅延 —';
+    $('hudRes').textContent = '—';
+  }
+  function resetSendIceDiag(){
+    $('sendIceState').textContent = '—';
+    $('sendLocalCand').textContent = '—';
+    $('sendRemoteCand').textContent = '—';
+    $('sendPair').textContent = '—';
+  }
+  function resetRecvIceDiag(){
+    $('recvIceState').textContent = '—';
+    $('recvLocalCand').textContent = '—';
+    $('recvRemoteCand').textContent = '—';
+    $('recvPair').textContent = '—';
   }
 
   /* ================= 統計（経路 / fps / 遅延 / 解像度） ================= */
@@ -872,16 +996,50 @@
     tryCapture();
   });
 
+  var SEND_SIGNAL_MAX_RETRY = 3;
+
   function startSendPeer(code){
     sending = true;
     $('connectBtn').disabled = true;
-    $('sendStatus').innerHTML = '接続しています…（コード <strong>' + code + '</strong>）';
+    sendSignalRetry = 0;
+    sendCallStarted = false;
+    attemptSendPeer(code);
+  }
+
+  function attemptSendPeer(code){
+    $('sendStatus').innerHTML = '接続しています…（コード <strong>' + code + '</strong>）' + (sendSignalRetry ? '（再接続 ' + sendSignalRetry + ' 回目）' : '');
     var remoteId = PEER_PREFIX + code;
-    sendPeer = newPeer(null);
+    // 作り直しのたびに期限付きTURN認証情報を新しく生成してから Peer を作る。
+    // 生成を待つ間にリセットされていたら作らない。
+    newPeerAsync(null, function(peer){
+      if (!sending || !peer) {
+        if (peer) { try { peer.destroy(); } catch (e) {} }
+        if (sending && !peer) failSend('接続を開始できませんでした。最初からやり直してください。');
+        return;
+      }
+      sendPeer = peer;
+      bindSendPeer(peer, code, remoteId);
+    });
+  }
+
+  function bindSendPeer(peer, code, remoteId){
     var opened = false;
 
-    sendPeer.on('open', function(){
+    peer.on('open', function(){
+      if (sendPeer !== peer) return;
       opened = true;
+      sendSignalRetry = 0;
+      sendDiscRetry = 0;
+      if (sendDiscTimer) { clearTimeout(sendDiscTimer); sendDiscTimer = null; }
+      if (sendCallStarted) {
+        // シグナリング再接続後に open が再発火しただけ: 二重発信はしない
+        if (sending && sendIceConnected) {
+          $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。';
+        } else if (sending && !sendIceFailed) {
+          $('sendStatus').innerHTML = '接続サーバーへ再接続しました。接続を続けています…（コード <strong>' + code + '</strong>）';
+        }
+        return;
+      }
       sendIceConnected = false; sendIceFailed = false;
       hideMsg($('sendFailMsg')); setSendNote(null);
 
@@ -894,14 +1052,17 @@
       }
 
       // 映像発信（第2引数 = getDisplayMedia で取得した画面ストリーム）
-      sendCall = sendPeer.call(remoteId, localStream);
+      sendCall = peer.call(remoteId, localStream);
       if (!sendCall) {
         failSend('発信を開始できませんでした。最初からやり直してください。');
         return;
       }
+      sendCallStarted = true;
       // 送信パラメータ（ビットレート等）は接続直後と安定後に適用
       setTimeout(applySenderParams, 800);
       setTimeout(applySenderParams, 3000);
+      resetSendPreviewStats();
+      resetSendIceDiag();
       $('sendDiag').classList.add('show');
       var thisCall = sendCall;
       whenPeerConnection(thisCall, function(pc){
@@ -945,10 +1106,35 @@
       });
     });
 
-    sendPeer.on('error', function(err){
-      if (err && err.type === 'peer-unavailable' && !sendIceConnected && !sendIceFailed) {
-        failSend('コード「' + code + '」のiPadが見つかりませんでした。iPad側で「iPadで映す」を開いてコードが表示されていること、数字が一致していることを確認してください。');
-      } else if (!opened) {
+    peer.on('error', function(err){
+      if (sendPeer !== peer) return;
+      var etype = err && err.type ? err.type : '';
+      if (!sendCallStarted && (etype === 'network' || etype === 'server-error')) {
+        // 接続サーバーへの到達自体の一時的な失敗（network / server-error）:
+        // 「相手が見つからない（peer-unavailable）」とは区別し、行き止まりにせず、
+        // 取得済みの画面は保持したまま、まず reconnect を試し、ダメなら
+        // ピアを作り直して（期限付きTURN認証情報も再生成）自動で再試行する。
+        // ※ disconnected の場合は先に peer.reconnect() で復帰を試み、
+        //   戻らなければ同じ作り直し再試行に合流する（下の disconnected 参照）。
+        if (sendSignalRetry < SEND_SIGNAL_MAX_RETRY) {
+          sendSignalRetry++;
+          showMsg($('sendMsg'), 'warn', '接続サーバーへ届きませんでした。自動で再接続を試みています…（' + sendSignalRetry + ' / ' + SEND_SIGNAL_MAX_RETRY + ' 回目）');
+          $('sendStatus').textContent = '接続サーバーへ再接続しています…';
+          sendPeer = null;
+          try { peer.destroy(); } catch (e) {}
+          if (sendRetryTimer) clearTimeout(sendRetryTimer);
+          sendRetryTimer = setTimeout(function(){
+            sendRetryTimer = null;
+            if (sending) attemptSendPeer(code);
+          }, 1500 * sendSignalRetry);
+          return;
+        }
+        failSend('接続サーバー自体へ届きませんでした（' + SEND_SIGNAL_MAX_RETRY + '回再接続しても復旧しませんでした）。これは「相手が見つからない」のとは別の問題で、このPCから接続サーバー（PeerJS）へ届いていない状態です。PCのネットワーク接続を確認し、少し待ってから最初からやり直してください。');
+        return;
+      }
+      if (etype === 'peer-unavailable' && !sendIceConnected && !sendIceFailed) {
+        failSend('コード「' + code + '」のiPadが見つかりませんでした（接続サーバーには届いています）。iPad側で「iPadで映す」を開いてコードが表示されていること、数字が一致していることを確認してください。');
+      } else if (!opened && !sendCallStarted) {
         failSend(peerErrorText(err));
       } else if (sendIceFailed || sendIceConnected) {
         // PeerJS は補助接続のエラーをピア全体のエラーとしても上げることがある。
@@ -958,9 +1144,33 @@
         showMsg($('sendMsg'), 'error', peerErrorText(err));
       }
     });
-    sendPeer.on('disconnected', function(){
+    peer.on('disconnected', function(){
+      if (sendPeer !== peer) return;
+      if (!sending) return;
       if (sendIceFailed) { setSendNote('接続サーバーから切断されました'); return; }
-      if (sending) showMsg($('sendMsg'), 'warn', '接続サーバーから切断されました。映像が止まる場合は「最初からやり直す」を押してください。');
+      // シグナリングが切れたら、まず peer.reconnect() で自動再接続を試みる
+      // （確立済みの映像自体は流れ続ける）。発信前で reconnect() しても
+      // 戻らない場合は、Peer を作り直して（期限付きTURN認証情報も再生成）
+      // 数回まで自動で再試行する。即終了にはしない。
+      showMsg($('sendMsg'), 'warn', '接続サーバーから切断されました。再接続を試みています…');
+      $('sendStatus').textContent = '接続サーバーへ再接続しています…';
+      try { peer.reconnect(); } catch (e) {}
+      if (sendIceConnected || sendCallStarted) return; // 通話中・発信済みは reconnect() の結果を待つ
+      if (sendDiscTimer) clearTimeout(sendDiscTimer);
+      sendDiscTimer = setTimeout(function(){
+        sendDiscTimer = null;
+        if (!sending || sendPeer !== peer || peer.open) return;
+        if (sendDiscRetry >= SEND_SIGNAL_MAX_RETRY && sendSignalRetry >= SEND_SIGNAL_MAX_RETRY) {
+          failSend('接続サーバー自体へ届きませんでした（再接続を繰り返しても復旧しませんでした）。これは「相手が見つからない」のとは別の問題で、このPCから接続サーバー（PeerJS）へ届いていない状態です。PCのネットワーク接続を確認し、少し待ってから最初からやり直してください。');
+          return;
+        }
+        sendDiscRetry++;
+        sendSignalRetry = Math.max(sendSignalRetry, sendDiscRetry);
+        showMsg($('sendMsg'), 'warn', '接続サーバーへ届きませんでした。Peerを作り直して自動で再接続を試みています…（' + sendDiscRetry + ' / ' + SEND_SIGNAL_MAX_RETRY + ' 回目）');
+        sendPeer = null;
+        try { peer.destroy(); } catch (e) {}
+        if (sending) attemptSendPeer(code);
+      }, 4000);
     });
   }
 
@@ -991,8 +1201,11 @@
     var keepDiag = sendIceFailed; // ICE失敗時は診断バー（候補の内訳）を画面に残す
     sending = false;
     $('connectBtn').disabled = false;
+    if (sendRetryTimer) { clearTimeout(sendRetryTimer); sendRetryTimer = null; }
+    if (sendDiscTimer) { clearTimeout(sendDiscTimer); sendDiscTimer = null; }
+    sendSignalRetry = 0; sendDiscRetry = 0; sendCallStarted = false;
     if (sendDiag) { sendDiag.stop(); sendDiag = null; }
-    if (!keepDiag) $('sendDiag').classList.remove('show');
+    if (!keepDiag) { $('sendDiag').classList.remove('show'); resetSendIceDiag(); }
     if (sendStatsTimer) { clearInterval(sendStatsTimer); sendStatsTimer = null; }
     if (sendCall) { try { sendCall.close(); } catch (e) {} sendCall = null; }
     if (sendConn) { try { sendConn.close(); } catch (e) {} sendConn = null; }
@@ -1001,7 +1214,10 @@
       localStream.getTracks().forEach(function(t){ try { t.stop(); } catch (e) {} });
       localStream = null;
     }
-    $('localVideo').srcObject = null;
+    // プレビューの残骸（最後のフレームや「1.00」のような数値表示）を消す:
+    // 映像をクリアし、統計も初期表示に戻し、空表示（不透明）で覆う
+    clearVideoEl($('localVideo'));
+    resetSendPreviewStats();
     $('sendEmpty').classList.remove('hide');
     $('sendStats').classList.remove('show');
     if (!keepMessage) {
@@ -1033,18 +1249,35 @@
     createReceiverPeer();
   }
 
-  function createReceiverPeer(){
-    recvCode = randomCode();
-    recvPeer = newPeer(PEER_PREFIX + recvCode);
+  function createReceiverPeer(keepCode){
+    if (!keepCode) recvCode = randomCode();
+    var myGen = ++recvGen;
+    var myCode = recvCode;
+    // 作り直しのたびに期限付きTURN認証情報を新しく生成してから Peer を作る
+    newPeerAsync(PEER_PREFIX + myCode, function(peer){
+      if (myGen !== recvGen) { if (peer) { try { peer.destroy(); } catch (e) {} } return; }
+      if (!peer) {
+        showMsg($('recvMsg'), 'error', '接続を開始できませんでした。ページを再読み込みしてください。');
+        return;
+      }
+      recvPeer = peer;
+      bindReceiverPeer(peer);
+    });
+  }
 
-    recvPeer.on('open', function(id){
+  function bindReceiverPeer(peer){
+    peer.on('open', function(id){
+      recvSignalRetry = 0;
+      recvDiscRetry = 0;
+      if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+      if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
       $('bigCode').textContent = recvCode;
       $('bigCode').classList.remove('waiting');
       $('copyCodeBtn').disabled = false;
       $('recvStatus').textContent = 'PCからの接続を待っています。PC側でこのコードを入力してください。';
     });
 
-    recvPeer.on('connection', function(conn){
+    peer.on('connection', function(conn){
       recvConn = conn;
       conn.on('data', function(data){
         if (data && data.type === 'pos' && POSITIONS.indexOf(data.pos) >= 0) {
@@ -1058,7 +1291,7 @@
       conn.on('close', function(){ setRecvNote('閉じられました（映像の受信には影響しません）'); });
     });
 
-    recvPeer.on('call', function(call){
+    peer.on('call', function(call){
       recvCall = call;
       recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
       hideMsg($('recvMsg')); hideMsg($('recvFailMsg'));
@@ -1067,6 +1300,8 @@
       $('recvStatus').textContent = 'PCから接続がありました。映像を待っています…';
       // 受信専用：自分からは映像を送らないため、引数なしで応答する（PeerJSの受信専用の形）
       call.answer();
+      resetRecvPreviewStats();
+      resetRecvIceDiag();
       $('recvDiag').classList.add('show');
       var diag = null; // この通話専用の診断オブジェクト（close 時にも参照する）
       whenPeerConnection(call, function(pc){
@@ -1163,7 +1398,32 @@
       });
     });
 
-    recvPeer.on('error', function(err){
+    peer.on('error', function(err){
+      var rtype = err && err.type ? err.type : '';
+      if ((rtype === 'network' || rtype === 'server-error') && !recvCall && !recvIceFailed) {
+        // 接続サーバーへの到達自体の一時的な失敗: 行き止まりにせず、
+        // コードは維持したまま自動で再接続する（効かなければ同じコードで作り直す）
+        if (recvSignalRetry < 3) {
+          recvSignalRetry++;
+          showMsg($('recvMsg'), 'warn', '接続サーバーへ届きませんでした。自動で再接続を試みています…（' + recvSignalRetry + ' / 3 回目）。コードはそのまま使えます。');
+          $('recvStatus').textContent = '接続サーバーへ再接続しています…';
+          var peerAtError = recvPeer;
+          try { if (peerAtError.disconnected) peerAtError.reconnect(); } catch (e) {}
+          if (recvRetryTimer) clearTimeout(recvRetryTimer);
+          recvRetryTimer = setTimeout(function(){
+            recvRetryTimer = null;
+            if (recvPeer === peerAtError && recvPeer && !recvPeer.open && !recvCall) {
+              try { recvPeer.destroy(); } catch (e) {}
+              recvPeer = null;
+              createReceiverPeer(true);
+            }
+          }, 4000);
+          return;
+        }
+        showMsg($('recvMsg'), 'error', '接続サーバー自体へ届きませんでした（3回再接続しても復旧しませんでした）。これは相手の問題ではなく、このiPadから接続サーバー（PeerJS）へ届いていない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
+        $('recvStatus').textContent = '接続サーバーへ届きませんでした。';
+        return;
+      }
       if (err && err.type === 'unavailable-id' && recvRetry < 5) {
         // コード衝突: 別コードで再発行
         recvRetry++;
@@ -1181,14 +1441,34 @@
       showMsg($('recvMsg'), 'error', peerErrorText(err));
       $('recvStatus').textContent = '接続の待受に失敗しました。';
     });
-    recvPeer.on('disconnected', function(){
-      // シグナリングへの再接続を試みる（成功すればコードはそのまま維持される）
-      try { recvPeer.reconnect(); } catch (e) {}
+    peer.on('disconnected', function(){
+      // シグナリングへの再接続をまず peer.reconnect() で試みる
+      // （成功すればコードはそのまま維持される）
+      try { peer.reconnect(); } catch (e) {}
       if (recvCall || recvIceFailed) {
         setRecvNote('接続サーバーから切断されました（再接続を試みています）');
         return;
       }
-      showMsg($('recvMsg'), 'warn', '接続サーバーから切断されました。再接続を試みています。直らない場合は「最初からやり直す」を押してコードを作り直してください。');
+      showMsg($('recvMsg'), 'warn', '接続サーバーから切断されました。再接続を試みています…');
+      $('recvStatus').textContent = '接続サーバーへ再接続しています…';
+      // reconnect() しても戻らない場合は、同じコードのまま Peer を作り直して
+      // （期限付きTURN認証情報も再生成）数回まで自動で再試行する。即終了にはしない。
+      if (recvDiscTimer) clearTimeout(recvDiscTimer);
+      var peerAtDisc = peer;
+      recvDiscTimer = setTimeout(function(){
+        recvDiscTimer = null;
+        if (recvPeer !== peerAtDisc || peerAtDisc.open || recvCall) return;
+        if (recvDiscRetry >= 3) {
+          showMsg($('recvMsg'), 'error', '接続サーバー自体へ届きませんでした（再接続を繰り返しても復旧しませんでした）。これは相手の問題ではなく、このiPadから接続サーバー（PeerJS）へ届いていない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
+          $('recvStatus').textContent = '接続サーバーへ届きませんでした。';
+          return;
+        }
+        recvDiscRetry++;
+        showMsg($('recvMsg'), 'warn', '接続サーバーへ届きませんでした。Peerを作り直して自動で再接続を試みています…（' + recvDiscRetry + ' / 3 回目）。コードはそのまま使えます。');
+        try { peerAtDisc.destroy(); } catch (e) {}
+        if (recvPeer === peerAtDisc) recvPeer = null;
+        createReceiverPeer(true);
+      }, 4000);
     });
   }
 
@@ -1208,8 +1488,13 @@
   });
 
   function cleanupReceiver(){
+    recvGen++; // 生成途中の Peer があれば、その結果は破棄させる
+    if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+    if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+    recvSignalRetry = 0; recvDiscRetry = 0;
     if (recvDiag) { recvDiag.stop(); recvDiag = null; }
     $('recvDiag').classList.remove('show');
+    resetRecvIceDiag();
     if (recvWatchdog) { clearTimeout(recvWatchdog); recvWatchdog = null; }
     recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
     hideMsg($('recvFailMsg')); setRecvNote(null);
@@ -1218,7 +1503,10 @@
     if (recvConn) { try { recvConn.close(); } catch (e) {} recvConn = null; }
     if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
     remoteStream = null;
-    $('remoteVideo').srcObject = null;
+    // プレビューの残骸（最後のフレームや「1.00」のような数値表示）を消す:
+    // 映像をクリアし、統計・HUDも初期表示に戻し、空表示（不透明）で覆う
+    clearVideoEl($('remoteVideo'));
+    resetRecvPreviewStats();
     $('recvEmpty').classList.remove('hide');
     $('recvHud').classList.remove('show');
     $('recvTools').classList.remove('show');
