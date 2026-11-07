@@ -172,6 +172,12 @@
   .stats-bar.show{display:flex}
   .stats-bar b{color:var(--text);font-weight:700}
 
+  .diag-bar{
+    display:none;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--muted2);margin-top:6px;
+  }
+  .diag-bar.show{display:flex}
+  .diag-bar b{color:var(--muted);font-weight:700}
+
   .hidden{display:none !important}
   footer{margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   footer .note{font-size:12px;color:var(--muted2)}
@@ -273,6 +279,12 @@
         <span>遅延 <b id="sendRtt">—</b></span>
         <span>解像度 <b id="sendRes">—</b></span>
       </div>
+      <div class="diag-bar" id="sendDiag">
+        <span>ICE状態 <b id="sendIceState">—</b></span>
+        <span>自分の候補 <b id="sendLocalCand">—</b></span>
+        <span>相手の候補 <b id="sendRemoteCand">—</b></span>
+        <span>選択ペア <b id="sendPair">—</b></span>
+      </div>
       <div class="btn-row">
         <button class="btn" id="sendResetBtn" type="button">最初からやり直す</button>
       </div>
@@ -315,6 +327,12 @@
         <span>遅延 <b id="recvRtt">—</b></span>
         <span>解像度 <b id="recvRes">—</b></span>
       </div>
+      <div class="diag-bar" id="recvDiag">
+        <span>ICE状態 <b id="recvIceState">—</b></span>
+        <span>自分の候補 <b id="recvLocalCand">—</b></span>
+        <span>相手の候補 <b id="recvRemoteCand">—</b></span>
+        <span>選択ペア <b id="recvPair">—</b></span>
+      </div>
       <div class="btn-row">
         <button class="btn" id="recvResetBtn" type="button">最初からやり直す</button>
       </div>
@@ -333,13 +351,21 @@
 
   /* ================= 設定 ================= */
   var PEER_PREFIX = 'smgh-v1-';
+  // 発信側・受信側の両方が newPeer() 経由でこの同一 config を使う。
+  // TURN は UDP が塞がれた回線でも届くよう、80/443 の UDP・TCP と
+  // TLS(turns:443) をすべて入れる。
+  var TURN_AUTH = { username: 'openrelayproject', credential: 'openrelayproject' };
+  function turnServer(url){ var o = { urls: url }; o.username = TURN_AUTH.username; o.credential = TURN_AUTH.credential; return o; }
   var ICE_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
-      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-      { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+      { urls: 'stun:stun2.l.google.com:19302' },
+      turnServer('turn:openrelay.metered.ca:80'),
+      turnServer('turn:openrelay.metered.ca:80?transport=tcp'),
+      turnServer('turn:openrelay.metered.ca:443'),
+      turnServer('turn:openrelay.metered.ca:443?transport=tcp'),
+      turnServer('turns:openrelay.metered.ca:443?transport=tcp')
     ],
     iceCandidatePoolSize: 10
   };
@@ -360,11 +386,11 @@
 
   // 送信側
   var sendPeer = null, sendCall = null, sendConn = null, localStream = null, sendStatsTimer = null;
-  var sending = false;
+  var sending = false, sendDiag = null;
 
   // 受信側
   var recvPeer = null, recvCall = null, recvConn = null, recvCode = null, recvRetry = 0;
-  var remoteStream = null, recvStatsTimer = null, wakeLock = null;
+  var remoteStream = null, recvStatsTimer = null, wakeLock = null, recvDiag = null;
 
   /* ================= DOM ================= */
   function $(id){ return document.getElementById(id); }
@@ -518,6 +544,102 @@
     }
     tick();
     return setInterval(tick, 3000);
+  }
+
+  /* ================= ICE診断 =================
+     iceConnectionState の変化、自側で収集できた候補の種別（host/srflx/relay）、
+     相手側候補の種別、選択された候補ペア（local/remote の typ）を画面に出す。
+     failed のときは「中継候補が作れたか」で原因を切り分けた文を返す。
+     ※ onicecandidate プロパティは PeerJS がシグナリングに使うため触らず、
+       addEventListener で並行して観測する。 */
+  function attachIceDiag(pc, ui, handlers){
+    var localTypes = {}, remoteTypes = {}, selectedPair = null;
+    var connectedFired = false, failedFired = false, timer = null;
+
+    function typesText(map){
+      var order = ['host', 'srflx', 'prflx', 'relay'], out = [];
+      for (var i = 0; i < order.length; i++) {
+        if (map[order[i]]) out.push(order[i] === 'relay' ? 'relay（中継）' : order[i]);
+      }
+      return out.length ? out.join(' / ') : '—';
+    }
+    function render(){
+      if (ui.state) ui.state.textContent = pc.iceConnectionState || '—';
+      if (ui.local) ui.local.textContent = typesText(localTypes);
+      if (ui.remote) ui.remote.textContent = typesText(remoteTypes);
+      if (ui.pair) ui.pair.textContent = selectedPair ? ('local=' + selectedPair[0] + ' / remote=' + selectedPair[1]) : '—';
+    }
+    function diagnose(){
+      var hasLocalRelay = !!localTypes.relay, hasRemoteRelay = !!remoteTypes.relay;
+      if (!hasLocalRelay && !hasRemoteRelay) {
+        return '診断：両側とも中継（TURN）候補を作れていません。中継サーバーに届いていない可能性が高く、回線（会社のWi-Fi等）が中継接続を遮断していることがあります。自分の候補／相手の候補の表示に relay（中継）があるか確認してください。';
+      }
+      if (!hasLocalRelay) {
+        return '診断：この端末で中継候補が作れていません（中継サーバーに届いていない可能性）。回線がUDP/TCPのTURN接続を遮断していることがあります。';
+      }
+      if (!hasRemoteRelay) {
+        return '診断：相手側の中継候補が届いていません。相手側の回線で中継サーバーへ届いていない可能性があります。';
+      }
+      return '診断：中継候補は両側そろいましたが接続を確立できませんでした。中継サーバーの混雑、または回線側の遮断が考えられます。しばらく待って両側で最初からやり直してください。';
+    }
+    function onCand(ev){
+      if (ev.candidate) {
+        var m = / typ ([a-z]+)/.exec(ev.candidate.candidate || '');
+        if (m) localTypes[m[1]] = true;
+      }
+      render();
+    }
+    function onState(){
+      render();
+      var s = pc.iceConnectionState;
+      if ((s === 'connected' || s === 'completed') && !connectedFired) {
+        connectedFired = true;
+        if (handlers.onConnected) handlers.onConnected();
+      }
+      if (s === 'failed' && !failedFired) {
+        failedFired = true;
+        // failed 直後は候補情報が最終状態でないことがあるため、一拍置いて診断する
+        setTimeout(function(){ if (handlers.onFailed) handlers.onFailed(diagnose()); }, 600);
+      }
+    }
+    function tickStats(){
+      if (pc.connectionState === 'closed') { if (timer) clearInterval(timer); return; }
+      pc.getStats(null).then(function(report){
+        var lc = {}, rc = {}, pairs = [];
+        report.forEach(function(s){
+          if (s.type === 'local-candidate') lc[s.id] = s;
+          if (s.type === 'remote-candidate') { rc[s.id] = s; remoteTypes[s.candidateType] = true; }
+          if (s.type === 'candidate-pair' && s.nominated && (s.state === 'succeeded' || s.state === 'in-progress')) pairs.push(s);
+        });
+        for (var i = 0; i < pairs.length; i++) {
+          var l = lc[pairs[i].localCandidateId], r = rc[pairs[i].remoteCandidateId];
+          if (l && r) { selectedPair = [l.candidateType, r.candidateType]; break; }
+        }
+        render();
+      }).catch(function(){ /* 取れない間は前回表示を維持 */ });
+    }
+    pc.addEventListener('icecandidate', onCand);
+    pc.addEventListener('iceconnectionstatechange', onState);
+    timer = setInterval(tickStats, 2000);
+    tickStats();
+    render();
+    return {
+      stop: function(){
+        if (timer) clearInterval(timer);
+        try { pc.removeEventListener('icecandidate', onCand); } catch (e) {}
+        try { pc.removeEventListener('iceconnectionstatechange', onState); } catch (e) {}
+      }
+    };
+  }
+
+  // PeerJS は発信・着信直後に peerConnection を用意する。現れるまで待って診断を付ける。
+  function whenPeerConnection(call, cb){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      if (call.peerConnection) { clearInterval(iv); cb(call.peerConnection); }
+      else if (tries > 40) clearInterval(iv);
+    }, 300);
   }
 
   /* =====================================================
@@ -720,7 +842,29 @@
       // 送信パラメータ（ビットレート等）は接続直後と安定後に適用
       setTimeout(applySenderParams, 800);
       setTimeout(applySenderParams, 3000);
-      watchSendConnection();
+      $('sendDiag').classList.add('show');
+      var thisCall = sendCall;
+      whenPeerConnection(thisCall, function(pc){
+        if (sendCall !== thisCall) return; // 既に片付け済み
+        if (sendDiag) sendDiag.stop();
+        sendDiag = attachIceDiag(pc, {
+          state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
+        }, {
+          onConnected: function(){
+            $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。';
+            showMsg($('sendMsg'), 'ok', '接続しました。');
+            applySenderParams();
+            if (sendStatsTimer) clearInterval(sendStatsTimer);
+            $('sendStats').classList.add('show');
+            sendStatsTimer = startStats(pc, {
+              route: $('sendRoute'), fps: $('sendFps'), rtt: $('sendRtt'), res: $('sendRes')
+            }, false);
+          },
+          onFailed: function(diagText){
+            failSend('映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+          }
+        });
+      });
     });
 
     sendPeer.on('error', function(err){
@@ -737,32 +881,6 @@
     });
   }
 
-  function watchSendConnection(){
-    var tries = 0;
-    var iv = setInterval(function(){
-      tries++;
-      if (!sendCall || !sendCall.peerConnection) { if (tries > 20) clearInterval(iv); return; }
-      var pc = sendCall.peerConnection;
-      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-        clearInterval(iv);
-        $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。';
-        showMsg($('sendMsg'), 'ok', '接続しました。');
-        applySenderParams();
-        if (sendStatsTimer) clearInterval(sendStatsTimer);
-        $('sendStats').classList.add('show');
-        sendStatsTimer = startStats(pc, {
-          route: $('sendRoute'), fps: $('sendFps'), rtt: $('sendRtt'), res: $('sendRes')
-        }, false);
-      } else if (pc.iceConnectionState === 'failed') {
-        clearInterval(iv);
-        failSend('映像の通り道を作れませんでした。PCとiPadのネットワークを確認して、最初からやり直してください（別回線同士の場合は中継を試みますが、回線側で遮断されていると接続できません）。');
-      } else if (pc.iceConnectionState === 'closed') {
-        clearInterval(iv);
-      }
-      if (tries > 30) clearInterval(iv); // 約30秒で監視終了（状態表示は維持）
-    }, 1000);
-  }
-
   function failSend(text){
     showMsg($('sendMsg'), 'error', text);
     $('sendStatus').textContent = '接続できませんでした。';
@@ -772,6 +890,8 @@
   function cleanupSend(keepMessage){
     sending = false;
     $('connectBtn').disabled = false;
+    if (sendDiag) { sendDiag.stop(); sendDiag = null; }
+    $('sendDiag').classList.remove('show');
     if (sendStatsTimer) { clearInterval(sendStatsTimer); sendStatsTimer = null; }
     if (sendCall) { try { sendCall.close(); } catch (e) {} sendCall = null; }
     if (sendConn) { try { sendConn.close(); } catch (e) {} sendConn = null; }
@@ -838,6 +958,20 @@
       hideMsg($('recvMsg'));
       $('recvStatus').textContent = 'PCから接続がありました。映像を待っています…';
       call.answer(); // 受信側は映像を送らない
+      $('recvDiag').classList.add('show');
+      whenPeerConnection(call, function(pc){
+        if (recvCall !== call) return; // 既に片付け済み
+        if (recvDiag) recvDiag.stop();
+        recvDiag = attachIceDiag(pc, {
+          state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
+        }, {
+          onConnected: function(){ /* 接続表示は stream イベント側で行う */ },
+          onFailed: function(diagText){
+            showMsg($('recvMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+            $('recvStatus').textContent = '接続できませんでした。';
+          }
+        });
+      });
       call.on('stream', function(stream){
         remoteStream = stream;
         var v = $('remoteVideo');
@@ -855,7 +989,6 @@
             route: $('recvRoute'), fps: $('recvFps'), rtt: $('recvRtt'), res: $('recvRes'),
             hud: { route: $('hudRoute'), fps: $('hudFps'), rtt: $('hudRtt'), res: $('hudRes') }
           }, true);
-          watchRecvConnection(call.peerConnection);
         }
       });
       call.on('close', function(){
@@ -884,19 +1017,6 @@
     });
   }
 
-  function watchRecvConnection(pc){
-    var iv = setInterval(function(){
-      if (!recvCall) { clearInterval(iv); return; }
-      if (pc.iceConnectionState === 'failed') {
-        clearInterval(iv);
-        showMsg($('recvMsg'), 'error', '映像の通り道を作れませんでした。iPadとPCのネットワークを確認して、両側で最初からやり直してください（別回線同士の場合は中継を試みますが、回線側で遮断されていると接続できません）。');
-        $('recvStatus').textContent = '接続できませんでした。';
-      } else if (pc.iceConnectionState === 'closed' || pc.iceConnectionState === 'disconnected') {
-        clearInterval(iv);
-      }
-    }, 1500);
-  }
-
   $('copyCodeBtn').addEventListener('click', function(){
     if (!recvCode) return;
     var done = function(){
@@ -913,6 +1033,8 @@
   });
 
   function cleanupReceiver(){
+    if (recvDiag) { recvDiag.stop(); recvDiag = null; }
+    $('recvDiag').classList.remove('show');
     if (recvStatsTimer) { clearInterval(recvStatsTimer); recvStatsTimer = null; }
     if (recvCall) { try { recvCall.close(); } catch (e) {} recvCall = null; }
     if (recvConn) { try { recvConn.close(); } catch (e) {} recvConn = null; }
