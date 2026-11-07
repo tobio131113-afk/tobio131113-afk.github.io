@@ -183,6 +183,8 @@
   }
   .diag-bar.show{display:flex}
   .diag-bar b{color:var(--muted);font-weight:700}
+  .diag-bar.turn-diag span{flex:1 1 100%}
+  .diag-bar.turn-diag b{color:var(--danger);word-break:break-word}
 
   .hidden{display:none !important}
   footer{margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
@@ -292,6 +294,9 @@
         <span>相手の候補 <b id="sendRemoteCand">—</b></span>
         <span>選択ペア <b id="sendPair">—</b></span>
       </div>
+      <div class="diag-bar turn-diag" id="sendTurnDiag">
+        <span>中継エラー <b id="sendTurnErr">—</b></span>
+      </div>
       <div class="diag-bar" id="sendNoteBar">
         <span>補助接続（位置の共有） <b id="sendNote">—</b></span>
       </div>
@@ -350,6 +355,9 @@
         <span>相手の候補 <b id="recvRemoteCand">—</b></span>
         <span>選択ペア <b id="recvPair">—</b></span>
       </div>
+      <div class="diag-bar turn-diag" id="recvTurnDiag">
+        <span>中継エラー <b id="recvTurnErr">—</b></span>
+      </div>
       <div class="diag-bar" id="recvNoteBar">
         <span>補助接続（位置の共有） <b id="recvNote">—</b></span>
       </div>
@@ -399,7 +407,12 @@
       freeTurnServer('turn:freestun.net:3478?transport=tcp'),
       freeTurnServer('turn:freestun.net:3479'),
       freeTurnServer('turn:freestun.net:3479?transport=tcp'),
-      freeTurnServer('turns:freestun.net:5350')
+      freeTurnServer('turns:freestun.net:5350'),
+      {
+        urls: ["turn:aws-global-1.c.rstream.io:3478?transport=udp", "turn:aws-global-1.c.rstream.io:3478?transport=tcp", "turns:aws-global-1.c.rstream.io:5349?transport=udp", "turns:aws-global-1.c.rstream.io:5349?transport=tcp"],
+        username: "v1:1794042004:api:-:779f5e96b759fc62ea91b37d",
+        credential: "oDDJqNxJfI2rDmdCOKJac+4Zl0OkiAt1X3j/DVnEOf0="
+      }
     ];
   }
   /* ---- Metered 静的認証エンドポイント向け「期限付き認証情報」 ----
@@ -942,12 +955,16 @@
     $('sendLocalCand').textContent = '—';
     $('sendRemoteCand').textContent = '—';
     $('sendPair').textContent = '—';
+    var st = $('sendTurnErr'); if (st) st.textContent = '—';
+    var sb = $('sendTurnDiag'); if (sb) sb.classList.remove('show');
   }
   function resetRecvIceDiag(){
     $('recvIceState').textContent = '—';
     $('recvLocalCand').textContent = '—';
     $('recvRemoteCand').textContent = '—';
     $('recvPair').textContent = '—';
+    var rt = $('recvTurnErr'); if (rt) rt.textContent = '—';
+    var rb = $('recvTurnDiag'); if (rb) rb.classList.remove('show');
   }
 
   /* ================= 統計（経路 / fps / 遅延 / 解像度） ================= */
@@ -1016,6 +1033,9 @@
   /* ================= ICE診断 =================
      iceConnectionState の変化、自側で収集できた候補の種別（host/srflx/relay）、
      相手側候補の種別、選択された候補ペア（local/remote の typ）を画面に出す。
+     加えて icecandidateerror を拾い、中継（TURN）サーバーごとに
+     「どのURLで、どんなエラー（401等の認証エラーか、701到達不能か）」を
+     専用の診断欄（中継エラー）に簡潔に出す。失敗後も欄は消さない。
      failed のときは「中継候補が作れたか」で原因を切り分けた文を返す。
      ※ onicecandidate プロパティは PeerJS がシグナリングに使うため触らず、
        addEventListener で並行して観測する。 */
@@ -1037,18 +1057,76 @@
       if (ui.remote) ui.remote.textContent = typesText(remoteTypes);
       if (ui.pair) ui.pair.textContent = selectedPair ? ('local=' + selectedPair[0] + ' / remote=' + selectedPair[1]) : '—';
     }
+    /* ---- 中継（TURN）エラー: icecandidateerror をサーバーURLごとに集計 ----
+       event の url / errorCode / errorText を使う。表示は簡潔に
+       例）turn:freestun.net:3478 → 401（認証エラー）
+           turn:openrelay.metered.ca:443 → 701（到達不能） */
+    var turnErrMap = {};   // url -> { labels: {label:true}, order: [label] }
+    var turnErrOrder = []; // url の出現順
+    function turnErrLabel(code, text){
+      if (typeof code === 'number' && !isNaN(code)) {
+        if (code === 401 || code === 403 || code === 441) return code + '（認証エラー）';
+        if (code === 701) return '701（到達不能）';
+        if (code === 437) return '437（割当不一致）';
+        if (code === 486) return '486（割当上限）';
+        if (code === 487) return '487（役割競合）';
+        if (code === 508) return '508（容量不足）';
+        if (code === 500) return '500（サーバーエラー）';
+        if (code === 400) return '400（不正な要求）';
+        return String(code) + (text ? '（' + String(text).slice(0, 40) + '）' : '');
+      }
+      if (text) return String(text).slice(0, 60);
+      return 'エラー（詳細不明）';
+    }
+    function renderTurnErr(){
+      if (!ui.turn) return;
+      var parts = [];
+      for (var i = 0; i < turnErrOrder.length; i++) {
+        var u = turnErrOrder[i];
+        var e = turnErrMap[u];
+        parts.push(u + ' → ' + e.order.join(', '));
+      }
+      if (!parts.length) return;
+      ui.turn.textContent = parts.join(' ／ ');
+      if (ui.turnBar) ui.turnBar.classList.add('show');
+    }
+    function onIceCandidateError(ev){
+      if (!ev) return;
+      var url = '';
+      try { url = ev.url || ''; } catch (e) { url = ''; }
+      // 中継サーバー（turn: / turns:）のエラーだけを対象にする（STUNは対象外）
+      if (!url || (url.indexOf('turn:') !== 0 && url.indexOf('turns:') !== 0)) return;
+      var code = null;
+      try { if (typeof ev.errorCode === 'number') code = ev.errorCode; } catch (e) {}
+      var text = '';
+      try { text = ev.errorText || ''; } catch (e) {}
+      var label = turnErrLabel(code, text);
+      if (!turnErrMap[url]) { turnErrMap[url] = { labels: {}, order: [] }; turnErrOrder.push(url); }
+      if (!turnErrMap[url].labels[label]) { turnErrMap[url].labels[label] = true; turnErrMap[url].order.push(label); }
+      renderTurnErr();
+    }
+    function turnErrText(){
+      var parts = [];
+      for (var i = 0; i < turnErrOrder.length; i++) {
+        var u = turnErrOrder[i];
+        parts.push(u + ' → ' + turnErrMap[u].order.join(', '));
+      }
+      return parts.length ? ('中継エラー：' + parts.join(' ／ ')) : '';
+    }
     function diagnose(){
+      var turnNote = turnErrText();
+      var suffix = turnNote ? '\n' + turnNote : '';
       var hasLocalRelay = !!localTypes.relay, hasRemoteRelay = !!remoteTypes.relay;
       if (!hasLocalRelay && !hasRemoteRelay) {
-        return '診断：両側とも中継（TURN）候補を作れていません。中継サーバーに届いていない可能性が高く、回線（会社のWi-Fi等）が中継接続を遮断していることがあります。自分の候補／相手の候補の表示に relay（中継）があるか確認してください。';
+        return '診断：両側とも中継（TURN）候補を作れていません。中継サーバーに届いていない可能性が高く、回線（会社のWi-Fi等）が中継接続を遮断していることがあります。自分の候補／相手の候補の表示に relay（中継）があるか確認してください。' + suffix;
       }
       if (!hasLocalRelay) {
-        return '診断：この端末で中継候補が作れていません（中継サーバーに届いていない可能性）。回線がUDP/TCPのTURN接続を遮断していることがあります。';
+        return '診断：この端末で中継候補が作れていません（中継サーバーに届いていない可能性）。回線がUDP/TCPのTURN接続を遮断していることがあります。' + suffix;
       }
       if (!hasRemoteRelay) {
-        return '診断：相手側の中継候補が届いていません。相手側の回線で中継サーバーへ届いていない可能性があります。';
+        return '診断：相手側の中継候補が届いていません。相手側の回線で中継サーバーへ届いていない可能性があります。' + suffix;
       }
-      return '診断：中継候補は両側そろいましたが接続を確立できませんでした。中継サーバーの混雑、または回線側の遮断が考えられます。しばらく待って両側で最初からやり直してください。';
+      return '診断：中継候補は両側そろいましたが接続を確立できませんでした。中継サーバーの混雑、または回線側の遮断が考えられます。しばらく待って両側で最初からやり直してください。' + suffix;
     }
     function onCand(ev){
       if (ev.candidate) {
@@ -1116,6 +1194,7 @@
     }
     pc.addEventListener('icecandidate', onCand);
     pc.addEventListener('iceconnectionstatechange', onState);
+    try { pc.addEventListener('icecandidateerror', onIceCandidateError); } catch (e) {}
     timer = setInterval(tickStats, 2000);
     tickStats();
     render();
@@ -1125,9 +1204,12 @@
         if (discTimer) { clearTimeout(discTimer); discTimer = null; }
         try { pc.removeEventListener('icecandidate', onCand); } catch (e) {}
         try { pc.removeEventListener('iceconnectionstatechange', onState); } catch (e) {}
+        try { pc.removeEventListener('icecandidateerror', onIceCandidateError); } catch (e) {}
+        /* 中継エラーの表示は stop 後も消さない（ICE失敗後の切り分け材料として残す） */
       },
       // failed イベントを経ずに通話が閉じられた場合でも、その時点の候補情報から診断文を作る
       diagnoseNow: diagnose,
+      turnErrorText: turnErrText,
       wasConnected: function(){ return connectedFired; }
     };
   }
@@ -1397,7 +1479,7 @@
         if (sendCall !== thisCall) return; // 既に片付け済み
         if (sendDiag) sendDiag.stop();
         sendDiag = attachIceDiag(pc, {
-          state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
+          state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair'), turn: $('sendTurnErr'), turnBar: $('sendTurnDiag')
         }, {
           onConnected: function(){
             sendIceConnected = true;
@@ -1607,7 +1689,7 @@
       $('sendDiag').classList.add('show');
       if (sendDiag) sendDiag.stop();
       sendDiag = attachIceDiag(pc, {
-        state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
+        state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair'), turn: $('sendTurnErr'), turnBar: $('sendTurnDiag')
       }, {
         onConnected: function(){
           sendIceConnected = true;
@@ -1748,7 +1830,7 @@
       $('sendDiag').classList.add('show');
       if (sendDiag) sendDiag.stop();
       sendDiag = attachIceDiag(pc, {
-        state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
+        state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair'), turn: $('sendTurnErr'), turnBar: $('sendTurnDiag')
       }, {
         onConnected: function(){
           sendIceConnected = true;
@@ -1926,7 +2008,7 @@
         });
         if (recvDiag) recvDiag.stop();
         diag = attachIceDiag(pc, {
-          state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
+          state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair'), turn: $('recvTurnErr'), turnBar: $('recvTurnDiag')
         }, {
           onConnected: function(){ recvIceConnected = true; /* 接続表示は stream イベント側で行う */ },
           onDisconnected: function(){
@@ -2277,7 +2359,7 @@
       $('recvDiag').classList.add('show');
       if (recvDiag) recvDiag.stop();
       var diag = attachIceDiag(pc, {
-        state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
+        state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair'), turn: $('recvTurnErr'), turnBar: $('recvTurnDiag')
       }, {
         onConnected: function(){ recvIceConnected = true; if (recvHelloTimer) { clearInterval(recvHelloTimer); recvHelloTimer = null; } },
         onDisconnected: function(){
@@ -2497,7 +2579,7 @@
       $('recvDiag').classList.add('show');
       if (recvDiag) recvDiag.stop();
       var diag = attachIceDiag(pc, {
-        state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
+        state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair'), turn: $('recvTurnErr'), turnBar: $('recvTurnDiag')
       }, {
         onConnected: function(){ recvIceConnected = true; if (recvHttpsHelloTimer) { clearInterval(recvHttpsHelloTimer); recvHttpsHelloTimer = null; } },
         onDisconnected: function(){
