@@ -7,6 +7,7 @@
 <link rel="icon" href="data:," />
 <title>iPadサブモニター GitHub版</title>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <style>
   :root{
     color-scheme: dark;
@@ -294,6 +295,10 @@
       <div class="diag-bar" id="sendNoteBar">
         <span>補助接続（位置の共有） <b id="sendNote">—</b></span>
       </div>
+      <div class="diag-bar show" id="sendSigBar">
+        <span>接続経路 <b id="sendSigMode">標準</b></span>
+        <span>予備ブローカー <b id="sendMqttState">—</b></span>
+      </div>
       <div class="btn-row">
         <button class="btn" id="sendResetBtn" type="button">最初からやり直す</button>
       </div>
@@ -345,6 +350,10 @@
       </div>
       <div class="diag-bar" id="recvNoteBar">
         <span>補助接続（位置の共有） <b id="recvNote">—</b></span>
+      </div>
+      <div class="diag-bar show" id="recvSigBar">
+        <span>接続経路 <b id="recvSigMode">標準</b></span>
+        <span>予備ブローカー <b id="recvMqttState">—</b></span>
       </div>
       <div class="btn-row">
         <button class="btn" id="recvResetBtn" type="button">最初からやり直す</button>
@@ -470,6 +479,19 @@
   var remoteStream = null, recvStatsTimer = null, wakeLock = null, recvDiag = null;
   var recvIceConnected = false, recvIceFailed = false, recvStreamSeen = false, recvWatchdog = null;
 
+  /* ---- 予備シグナリング（MQTT）用の状態 ----
+     PeerJSクラウドへ届かない回線では、公開MQTTブローカー経由で
+     SDP / ICE candidate をやり取りし、生の RTCPeerConnection でつなぐ。 */
+  var MQTT_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081'];
+  var sendMode = 'peerjs'; // 'peerjs' | 'mqtt'
+  var recvMode = 'peerjs';
+  var sendMqttClient = null, sendMqttPc = null, sendMqttDc = null, sendMqttStarted = false;
+  var sendMqttConn = null, recvMqttConn = null;
+  var sendMqttOfferSent = false, sendMqttPendingCands = [];
+  var recvMqttClient = null, recvMqttPc = null, recvMqttDc = null, recvMqttStarted = false;
+  var recvHelloTimer = null, recvMqttPendingCands = [], recvMqttRemoteSet = false;
+  var sendMqttTopics = null, recvMqttTopics = null, recvMqttStandby = false;
+
   /* ================= DOM ================= */
   function $(id){ return document.getElementById(id); }
   var roleSendBtn = $('roleSend'), roleRecvBtn = $('roleRecv');
@@ -496,6 +518,144 @@
     if (!text) { bar.classList.remove('show'); return; }
     $('recvNote').textContent = text;
     bar.classList.add('show');
+  }
+  /* ---- 接続経路（標準／予備）と予備ブローカー接続状態の表示 ---- */
+  function setSendSig(modeText, mqttText){
+    if (modeText !== null && modeText !== undefined) $('sendSigMode').textContent = modeText;
+    if (mqttText !== null && mqttText !== undefined) $('sendMqttState').textContent = mqttText;
+    $('sendSigBar').classList.add('show');
+  }
+  function setRecvSig(modeText, mqttText){
+    if (modeText !== null && modeText !== undefined) $('recvSigMode').textContent = modeText;
+    if (mqttText !== null && mqttText !== undefined) $('recvMqttState').textContent = mqttText;
+    $('recvSigBar').classList.add('show');
+  }
+  /* トピック名には6桁コードをそのまま出さず、コードの SHA-256 ハッシュを使う
+     （ipsub1/<hash>/send|recv）。 */
+  var mqttTopicCache = {};
+  function primeMqttTopics(code){
+    if (!code || mqttTopicCache[code]) return;
+    mqttTopicsFor(code).then(function(t){ mqttTopicCache[code] = t; });
+  }
+  function mqttTopic(code, fromRole){
+    var t = mqttTopicCache[code];
+    return t ? t[fromRole] : ('ipsub1/' + code + '/' + fromRole);
+  }
+  function mqttTopicsFor(code){
+    if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
+      return Promise.resolve({ send: 'ipsub1/' + code + '/send', recv: 'ipsub1/' + code + '/recv' });
+    }
+    var enc = new window.TextEncoder();
+    return window.crypto.subtle.digest('SHA-256', enc.encode('ipsub1-topic:' + code)).then(function(h){
+      var bytes = new Uint8Array(h), hex = '';
+      for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes[i].toString(16)).slice(-2);
+      var base = 'ipsub1/' + hex.slice(0, 32);
+      return { send: base + '/send', recv: base + '/recv' };
+    }).catch(function(){
+      return { send: 'ipsub1/' + code + '/send', recv: 'ipsub1/' + code + '/recv' };
+    });
+  }
+  /* MQTTの全メッセージは、ペアリングコード（このセッション限りの共有秘密）
+     から PBKDF2 で導いた鍵で AES-GCM 暗号化して送る。公開ブローカー上でも
+     平文の SDP / ICE 候補（IPアドレス等）は流れず、コードを知らない第三者の
+     偽メッセージは復号（認証）に失敗して破棄される。 */
+  var mqttKeyCache = {};
+  function mqttKeyFor(code){
+    if (mqttKeyCache[code]) return mqttKeyCache[code];
+    var p;
+    if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
+      p = Promise.resolve(null);
+    } else {
+      var enc = new window.TextEncoder();
+      p = window.crypto.subtle.importKey('raw', enc.encode('ipsub1:' + code), 'PBKDF2', false, ['deriveKey']).then(function(base){
+        return window.crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: enc.encode('ipsub1-mqtt-v1'), iterations: 120000, hash: 'SHA-256' },
+          base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+        );
+      }).catch(function(){ return null; });
+    }
+    mqttKeyCache[code] = p;
+    return p;
+  }
+  function mqttReady(){ return typeof window.mqtt !== 'undefined' && window.mqtt && typeof window.mqtt.connect === 'function'; }
+  /* 公開MQTTブローカーへ順に接続を試みる。第1候補で制限時間内に
+     つながらなければ第2候補へ。両方ダメなら onBothFailed を呼ぶ。 */
+  function connectMqttFallback(handlers){
+    if (!mqttReady()) { handlers.onBothFailed('MQTTライブラリを読み込めませんでした'); return null; }
+    var cancelled = false, current = null, connected = false;
+    function attempt(idx){
+      if (cancelled) return;
+      if (idx >= MQTT_BROKERS.length) { handlers.onBothFailed('予備ブローカーへ接続できませんでした'); return; }
+      var url = MQTT_BROKERS[idx];
+      handlers.onStatus('接続中…（' + (idx + 1) + '番目のブローカー）');
+      var client = null;
+      try {
+        client = window.mqtt.connect(url, {
+          clientId: 'ipsub1-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36),
+          clean: true, connectTimeout: 7000, reconnectPeriod: 0, keepalive: 30
+        });
+      } catch (e) { attempt(idx + 1); return; }
+      current = client;
+      var settled = false;
+      var timer = setTimeout(function(){
+        if (settled || cancelled) return;
+        settled = true;
+        try { client.end(true); } catch (e) {}
+        attempt(idx + 1);
+      }, 9000);
+      client.on('connect', function(){
+        if (cancelled) { try { client.end(true); } catch (e) {} return; }
+        if (settled) return;
+        settled = true; connected = true;
+        clearTimeout(timer);
+        handlers.onStatus('接続できました（' + url.replace('wss://', '').split('/')[0] + '）');
+        handlers.onConnect(client, url);
+      });
+      client.on('message', function(topic, payload){
+        if (!cancelled && handlers.onMessage) handlers.onMessage(topic, payload, client);
+      });
+      client.on('error', function(){
+        if (connected || cancelled) return;
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { client.end(true); } catch (e) {}
+        attempt(idx + 1);
+      });
+    }
+    attempt(0);
+    return {
+      cancel: function(){
+        cancelled = true;
+        if (current) { try { current.end(true); } catch (e) {} current = null; }
+      }
+    };
+  }
+  function mqttPublish(client, topic, code, obj){
+    if (!client) return;
+    mqttKeyFor(code).then(function(key){
+      if (!key) return; // 暗号化できない環境では平文を送らず中止する
+      var iv = window.crypto.getRandomValues(new Uint8Array(12));
+      var enc = new window.TextEncoder();
+      window.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, enc.encode(JSON.stringify(obj))).then(function(ct){
+        try {
+          client.publish(topic, JSON.stringify({ v: 1, iv: bufferToBase64(iv), data: bufferToBase64(ct) }));
+        } catch (e) {}
+      }).catch(function(){});
+    });
+  }
+  // 受信ペイロードを復号する。暗号化されていないもの・認証に失敗したものは null（破棄）。
+  function decryptMqttPayload(payload, code){
+    var env;
+    try { env = JSON.parse(payload.toString()); } catch (e) { return Promise.resolve(null); }
+    if (!env || env.v !== 1 || !env.iv || !env.data) return Promise.resolve(null);
+    return mqttKeyFor(code).then(function(key){
+      if (!key) return null;
+      function b64(s){ var bin = window.atob(s), b = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); return b; }
+      return window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(env.iv) }, key, b64(env.data)).then(function(pt){
+        try { return JSON.parse(new window.TextDecoder().decode(pt)); } catch (e) { return null; }
+      }).catch(function(){ return null; });
+    });
   }
 
   /* ================= 位置グリッド ================= */
@@ -528,6 +688,9 @@
     $('hudPos').textContent = '位置：' + p;
     if (notify && sendConn && sendConn.open) {
       try { sendConn.send({ type: 'pos', pos: p }); } catch (e) {}
+    }
+    if (notify && sendMqttDc && sendMqttDc.readyState === 'open') {
+      try { sendMqttDc.send(JSON.stringify({ type: 'pos', pos: p })); } catch (e) {}
     }
   }
   setPosition(position, false);
@@ -842,9 +1005,14 @@
     return t ? t.value : 'window';
   }
 
+  function senderPc(){
+    if (sendCall && sendCall.peerConnection) return sendCall.peerConnection;
+    if (sendMqttPc) return sendMqttPc;
+    return null;
+  }
   function applySenderParams(){
-    if (!sendCall || !sendCall.peerConnection) return;
-    var pc = sendCall.peerConnection;
+    var pc = senderPc();
+    if (!pc) return;
     var senders = pc.getSenders ? pc.getSenders() : [];
     var q = QUALITY[selectedQuality()];
     senders.forEach(function(sender){
@@ -1000,6 +1168,7 @@
 
   function startSendPeer(code){
     sending = true;
+    primeMqttTopics(code);
     $('connectBtn').disabled = true;
     sendSignalRetry = 0;
     sendCallStarted = false;
@@ -1129,7 +1298,8 @@
           }, 1500 * sendSignalRetry);
           return;
         }
-        failSend('接続サーバー自体へ届きませんでした（' + SEND_SIGNAL_MAX_RETRY + '回再接続しても復旧しませんでした）。これは「相手が見つからない」のとは別の問題で、このPCから接続サーバー（PeerJS）へ届いていない状態です。PCのネットワーク接続を確認し、少し待ってから最初からやり直してください。');
+        showMsg($('sendMsg'), 'warn', '接続サーバー（標準経路）へ届きませんでした（' + SEND_SIGNAL_MAX_RETRY + '回再接続しても復旧しませんでした）。予備の接続経路へ自動で切り替えます…');
+        startMqttSender(code);
         return;
       }
       if (etype === 'peer-unavailable' && !sendIceConnected && !sendIceFailed) {
@@ -1161,7 +1331,8 @@
         sendDiscTimer = null;
         if (!sending || sendPeer !== peer || peer.open) return;
         if (sendDiscRetry >= SEND_SIGNAL_MAX_RETRY && sendSignalRetry >= SEND_SIGNAL_MAX_RETRY) {
-          failSend('接続サーバー自体へ届きませんでした（再接続を繰り返しても復旧しませんでした）。これは「相手が見つからない」のとは別の問題で、このPCから接続サーバー（PeerJS）へ届いていない状態です。PCのネットワーク接続を確認し、少し待ってから最初からやり直してください。');
+          showMsg($('sendMsg'), 'warn', '接続サーバー（標準経路）へ届きませんでした（再接続を繰り返しても復旧しませんでした）。予備の接続経路へ自動で切り替えます…');
+          startMqttSender(code);
           return;
         }
         sendDiscRetry++;
@@ -1191,6 +1362,124 @@
     }
   }
 
+  /* =====================================================
+     予備シグナリング（MQTT）: 送信側
+     iPad側の hello を受けてから offer を送る。SDP / ICE は
+     トピック ipsub1/<コード>/send（自分→相手）, /recv（相手→自分）
+     で JSON の trickle ICE としてやり取りする。
+  ===================================================== */
+  function teardownSendMqtt(){
+    if (sendMqttConn) { try { sendMqttConn.cancel(); } catch (e) {} sendMqttConn = null; }
+    if (sendMqttClient) { try { sendMqttClient.end(true); } catch (e) {} sendMqttClient = null; }
+    if (sendMqttDc) { try { sendMqttDc.close(); } catch (e) {} sendMqttDc = null; }
+    if (sendMqttPc) { try { sendMqttPc.close(); } catch (e) {} sendMqttPc = null; }
+    sendMqttStarted = false; sendMqttOfferSent = false; sendMqttPendingCands = [];
+  }
+  function startMqttSender(code){
+    if (sendMqttStarted) return;
+    if (!localStream) { failSend('画面の取得が終わってしまっています。もう一度「接続する」を押して、共有する画面を選び直してください。'); return; }
+    sendMqttStarted = true;
+    sendMode = 'mqtt';
+    setSendSig('予備', '接続中…');
+    // 標準経路の Peer は片付ける（画面ストリームは保持する）
+    if (sendRetryTimer) { clearTimeout(sendRetryTimer); sendRetryTimer = null; }
+    if (sendDiscTimer) { clearTimeout(sendDiscTimer); sendDiscTimer = null; }
+    if (sendPeer) { try { sendPeer.destroy(); } catch (e) {} sendPeer = null; }
+    sending = true;
+    $('connectBtn').disabled = true;
+    $('sendStatus').textContent = '予備の接続経路で接続しています…iPad側の応答を待っています。';
+    var conn = connectMqttFallback({
+      onStatus: function(t){ setSendSig(null, t); },
+      onBothFailed: function(reason){
+        setSendSig(null, '接続できませんでした');
+        failSend('予備の接続経路も使えませんでした（' + reason + '）。標準経路（接続サーバー）にも予備ブローカーにも届いていない状態です。PCのネットワーク接続を確認して、最初からやり直してください。');
+      },
+      onConnect: function(client){
+        sendMqttClient = client;
+        client.subscribe(mqttTopic(code, 'recv'), function(err){
+          if (err) setSendSig(null, '受信登録に失敗しました');
+        });
+        showMsg($('sendMsg'), 'info', '予備の接続経路につながりました。iPad側の応答を待っています…（iPad側は予備経路でも並行して待っています）');
+      },
+      onMessage: function(topic, payload){
+        decryptMqttPayload(payload, code).then(function(msg){
+        if (!msg) return;
+        if (msg.type === 'hello' && !sendMqttOfferSent) {
+          sendMqttOfferSent = true;
+          createSendMqttOffer(code);
+        } else if (msg.type === 'answer' && sendMqttPc) {
+          sendMqttPc.setRemoteDescription(new RTCSessionDescription(msg.sdp)).then(function(){
+            sendMqttPendingCands.forEach(function(c){ addSendMqttCand(c); });
+            sendMqttPendingCands = [];
+          }).catch(function(){});
+        } else if (msg.type === 'candidate') {
+          if (sendMqttPc && sendMqttPc.remoteDescription) addSendMqttCand(msg.candidate);
+          else sendMqttPendingCands.push(msg.candidate);
+        }
+        });
+      }
+    });
+    sendMqttConn = conn;
+  }
+  function addSendMqttCand(cand){
+    if (!sendMqttPc || !cand) return;
+    sendMqttPc.addIceCandidate(new RTCIceCandidate(cand)).catch(function(){});
+  }
+  function createSendMqttOffer(code){
+    buildIceConfig().then(function(iceConfig){
+      if (!sending || sendMode !== 'mqtt' || !localStream) return;
+      var pc = new RTCPeerConnection(iceConfig);
+      sendMqttPc = pc;
+      localStream.getTracks().forEach(function(t){ pc.addTrack(t, localStream); });
+      // 位置情報は接続確立後の DataChannel で渡す
+      try {
+        sendMqttDc = pc.createDataChannel('pos');
+        sendMqttDc.onopen = function(){
+          setSendNote('つながっています（予備経路）');
+          try { sendMqttDc.send(JSON.stringify({ type: 'pos', pos: position })); } catch (e) {}
+        };
+        sendMqttDc.onclose = function(){ setSendNote('閉じられました（映像には影響しません）'); };
+      } catch (e) { setSendNote('開けませんでした（映像には影響しません）'); }
+      pc.onicecandidate = function(ev){
+        if (ev.candidate) mqttPublish(sendMqttClient, mqttTopic(code, 'send'), code, { type: 'candidate', candidate: ev.candidate.toJSON() });
+      };
+      resetSendPreviewStats(); resetSendIceDiag();
+      $('sendDiag').classList.add('show');
+      if (sendDiag) sendDiag.stop();
+      sendDiag = attachIceDiag(pc, {
+        state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
+      }, {
+        onConnected: function(){
+          sendIceConnected = true;
+          $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。（予備経路）';
+          showMsg($('sendMsg'), 'ok', '接続しました。（予備経路）');
+          applySenderParams();
+          setTimeout(applySenderParams, 800); setTimeout(applySenderParams, 3000);
+          if (sendStatsTimer) clearInterval(sendStatsTimer);
+          $('sendStats').classList.add('show');
+          sendStatsTimer = startStats(pc, { route: $('sendRoute'), fps: $('sendFps'), rtt: $('sendRtt'), res: $('sendRes') }, false);
+        },
+        onDisconnected: function(){
+          if (sending && sendIceConnected) $('sendStatus').textContent = '接続が一時的に途切れました。自動で回復を待っています…';
+        },
+        onRecovered: function(){
+          if (sending && sendIceConnected) $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。（予備経路）';
+        },
+        onFailed: function(diagText){
+          sendIceFailed = true;
+          showMsg($('sendFailMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+          failSend('映像の通り道（ICE）を確立できませんでした。くわしい診断は「送信中の画面」の下に残してあります。');
+        }
+      });
+      pc.createOffer().then(function(offer){ return pc.setLocalDescription(offer); }).then(function(){
+        mqttPublish(sendMqttClient, mqttTopic(code, 'send'), code, { type: 'offer', sdp: pc.localDescription });
+        $('sendStatus').textContent = '予備経路で発信しました。接続の確立を待っています…';
+      }).catch(function(){
+        failSend('予備経路での発信に失敗しました。最初からやり直してください。');
+      });
+    });
+  }
+
   function failSend(text){
     showMsg($('sendMsg'), 'error', text);
     $('sendStatus').textContent = '接続できませんでした。';
@@ -1200,6 +1489,8 @@
   function cleanupSend(keepMessage){
     var keepDiag = sendIceFailed; // ICE失敗時は診断バー（候補の内訳）を画面に残す
     sending = false;
+    teardownSendMqtt();
+    if (!keepMessage) { sendMode = 'peerjs'; setSendSig('標準', '—'); }
     $('connectBtn').disabled = false;
     if (sendRetryTimer) { clearTimeout(sendRetryTimer); sendRetryTimer = null; }
     if (sendDiscTimer) { clearTimeout(sendDiscTimer); sendDiscTimer = null; }
@@ -1237,7 +1528,7 @@
   }
 
   function startReceiver(){
-    if (recvPeer) return; // 既にコード発行済み
+    if (recvPeer || recvMqttStarted) return; // 既にコード発行済み／予備経路で待受中
     hideMsg($('recvMsg')); hideMsg($('recvFailMsg')); setRecvNote(null);
     if (!peerJsReady()) {
       $('bigCode').textContent = '読み込みに失敗しました';
@@ -1251,6 +1542,7 @@
 
   function createReceiverPeer(keepCode){
     if (!keepCode) recvCode = randomCode();
+    primeMqttTopics(recvCode);
     var myGen = ++recvGen;
     var myCode = recvCode;
     // 作り直しのたびに期限付きTURN認証情報を新しく生成してから Peer を作る
@@ -1275,6 +1567,8 @@
       $('bigCode').classList.remove('waiting');
       $('copyCodeBtn').disabled = false;
       $('recvStatus').textContent = 'PCからの接続を待っています。PC側でこのコードを入力してください。';
+      // 標準経路で待受が成立したら、予備経路でも並行して待つ（二重待受）
+      startRecvMqttStandby();
     });
 
     peer.on('connection', function(conn){
@@ -1292,6 +1586,8 @@
     });
 
     peer.on('call', function(call){
+      // 標準経路で接続が始まったら、予備待受は片付ける
+      if (recvMqttStarted && recvMode !== 'mqtt') teardownRecvMqtt();
       recvCall = call;
       recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
       hideMsg($('recvMsg')); hideMsg($('recvFailMsg'));
@@ -1399,6 +1695,7 @@
     });
 
     peer.on('error', function(err){
+      if (recvMode === 'mqtt') { setRecvNote('接続サーバーのエラー（予備経路で待受中）'); return; }
       var rtype = err && err.type ? err.type : '';
       if ((rtype === 'network' || rtype === 'server-error') && !recvCall && !recvIceFailed) {
         // 接続サーバーへの到達自体の一時的な失敗: 行き止まりにせず、
@@ -1420,8 +1717,8 @@
           }, 4000);
           return;
         }
-        showMsg($('recvMsg'), 'error', '接続サーバー自体へ届きませんでした（3回再接続しても復旧しませんでした）。これは相手の問題ではなく、このiPadから接続サーバー（PeerJS）へ届いていない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
-        $('recvStatus').textContent = '接続サーバーへ届きませんでした。';
+        showMsg($('recvMsg'), 'warn', '接続サーバー（標準経路）へ届きませんでした（3回再接続しても復旧しませんでした）。予備の接続経路へ自動で切り替えます…コードはそのまま使えます。');
+        startMqttReceiver();
         return;
       }
       if (err && err.type === 'unavailable-id' && recvRetry < 5) {
@@ -1442,6 +1739,7 @@
       $('recvStatus').textContent = '接続の待受に失敗しました。';
     });
     peer.on('disconnected', function(){
+      if (recvMode === 'mqtt') { setRecvNote('接続サーバーから切断されました（予備経路で待受中）'); return; }
       // シグナリングへの再接続をまず peer.reconnect() で試みる
       // （成功すればコードはそのまま維持される）
       try { peer.reconnect(); } catch (e) {}
@@ -1459,8 +1757,8 @@
         recvDiscTimer = null;
         if (recvPeer !== peerAtDisc || peerAtDisc.open || recvCall) return;
         if (recvDiscRetry >= 3) {
-          showMsg($('recvMsg'), 'error', '接続サーバー自体へ届きませんでした（再接続を繰り返しても復旧しませんでした）。これは相手の問題ではなく、このiPadから接続サーバー（PeerJS）へ届いていない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
-          $('recvStatus').textContent = '接続サーバーへ届きませんでした。';
+          showMsg($('recvMsg'), 'warn', '接続サーバー（標準経路）へ届きませんでした（再接続を繰り返しても復旧しませんでした）。予備の接続経路へ自動で切り替えます…コードはそのまま使えます。');
+          startMqttReceiver();
           return;
         }
         recvDiscRetry++;
@@ -1487,7 +1785,214 @@
     }
   });
 
+  /* =====================================================
+     予備シグナリング（MQTT）: 受信側
+     コードは維持したまま予備経路に切り替え、hello を接続完了まで
+     数秒おきに再送する。PCからの offer を受けて生の
+     RTCPeerConnection で応答し、位置情報は DataChannel で受ける。
+  ===================================================== */
+  function teardownRecvMqtt(){
+    if (recvHelloTimer) { clearInterval(recvHelloTimer); recvHelloTimer = null; }
+    if (recvMqttConn) { try { recvMqttConn.cancel(); } catch (e) {} recvMqttConn = null; }
+    if (recvMqttClient) { try { recvMqttClient.end(true); } catch (e) {} recvMqttClient = null; }
+    if (recvMqttDc) { try { recvMqttDc.close(); } catch (e) {} recvMqttDc = null; }
+    if (recvMqttPc) { try { recvMqttPc.close(); } catch (e) {} recvMqttPc = null; }
+    recvMqttStarted = false; recvMqttStandby = false; recvMqttPendingCands = []; recvMqttRemoteSet = false;
+  }
+  /* 予備経路への切替（標準経路の再試行が尽きた場合）。
+     すでに予備待受（standby）が動いていれば、それを本経路へ昇格させるだけ。 */
+  function startMqttReceiver(){
+    if (!recvCode) return;
+    if (recvMqttStarted) {
+      // 予備待受中なら昇格: 標準側だけ片付ける
+      recvMqttStandby = false;
+      recvMode = 'mqtt';
+      setRecvSig('予備', null);
+      if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+      if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+      recvGen++;
+      if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+      $('recvStatus').textContent = '予備の接続経路でPCからの接続を待っています。PC側でこのコードを入力してください。';
+      return;
+    }
+    startRecvMqtt(false);
+  }
+  /* 標準経路で待受中のあいだも、同じコードで予備経路を並行して待つ（二重待受）。
+     片側（PC側）だけ標準経路に届かない場合でも、PCが予備へ切り替われば
+     この待受に届く。どちらかで接続が始まったら、他方は片付ける。 */
+  function startRecvMqttStandby(){
+    if (recvMqttStarted || !recvCode) return;
+    startRecvMqtt(true);
+  }
+  function startRecvMqtt(standby){
+    if (recvMqttStarted || !recvCode) return;
+    recvMqttStarted = true;
+    recvMqttStandby = !!standby;
+    primeMqttTopics(recvCode);
+    if (!standby) {
+      recvMode = 'mqtt';
+      setRecvSig('予備', '接続中…');
+      if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+      if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+      recvGen++; // 生成途中の PeerJS 生成結果は破棄する
+      if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+      // コード表示はそのまま維持する
+      $('bigCode').textContent = recvCode;
+      $('bigCode').classList.remove('waiting');
+      $('copyCodeBtn').disabled = false;
+      $('recvStatus').textContent = '予備の接続経路でPCからの接続を待っています。PC側でこのコードを入力してください。';
+    } else {
+      setRecvSig('標準＋予備待受', '接続中…');
+    }
+    var code = recvCode;
+    var conn = connectMqttFallback({
+      onStatus: function(t){ setRecvSig(null, t); },
+      onBothFailed: function(reason){
+        if (recvMqttStandby) {
+          // 予備待受が使えなくても標準経路の待受は続ける（バナーは出さない）
+          setRecvSig(null, '接続できませんでした（標準経路で待受中）');
+          recvMqttStarted = false; recvMqttStandby = false;
+          return;
+        }
+        setRecvSig(null, '接続できませんでした');
+        showMsg($('recvMsg'), 'error', '予備の接続経路も使えませんでした（' + reason + '）。標準経路（接続サーバー）にも予備ブローカーにも届いていない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
+        $('recvStatus').textContent = '接続できませんでした。';
+      },
+      onConnect: function(client){
+        recvMqttClient = client;
+        client.subscribe(mqttTopic(code, 'send'), function(err){
+          if (err) setRecvSig(null, '受信登録に失敗しました');
+        });
+        if (!recvMqttStandby) {
+          showMsg($('recvMsg'), 'info', '予備の接続経路で待っています。コードはそのまま「' + code + '」です。');
+        }
+        // 在席通知（hello）を接続完了まで数秒おきに再送する
+        var sendHello = function(){ mqttPublish(client, mqttTopic(code, 'recv'), code, { type: 'hello' }); };
+        sendHello();
+        if (recvHelloTimer) clearInterval(recvHelloTimer);
+        recvHelloTimer = setInterval(function(){
+          if (recvIceConnected || recvStreamSeen) { clearInterval(recvHelloTimer); recvHelloTimer = null; return; }
+          sendHello();
+        }, 3000);
+      },
+      onMessage: function(topic, payload){
+        decryptMqttPayload(payload, code).then(function(msg){
+          if (!msg) return;
+          if (msg.type === 'offer') {
+            // 予備経路で接続が始まったら、標準側（PeerJS待受）を片付けて予備を本経路にする
+            if (recvMqttStandby) {
+              recvMqttStandby = false;
+              recvMode = 'mqtt';
+              setRecvSig('予備', null);
+              recvGen++;
+              if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+              if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+              if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+            }
+            handleMqttOffer(code, msg.sdp);
+          }
+          else if (msg.type === 'candidate') {
+            if (recvMqttPc && recvMqttRemoteSet) {
+              recvMqttPc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(function(){});
+            } else recvMqttPendingCands.push(msg.candidate);
+          }
+        });
+      }
+    });
+    recvMqttConn = conn;
+  }
+  function handleMqttOffer(code, sdp){
+    if (recvMqttPc) { try { recvMqttPc.close(); } catch (e) {} recvMqttPc = null; }
+    recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
+    hideMsg($('recvMsg')); hideMsg($('recvFailMsg'));
+    if (recvWatchdog) { clearTimeout(recvWatchdog); recvWatchdog = null; }
+    if (recvStatsTimer) { clearInterval(recvStatsTimer); recvStatsTimer = null; }
+    $('recvStatus').textContent = 'PCから接続がありました（予備経路）。映像を待っています…';
+    buildIceConfig().then(function(iceConfig){
+      if (recvMode !== 'mqtt' || !recvMqttStarted) return;
+      var pc = new RTCPeerConnection(iceConfig);
+      recvMqttPc = pc;
+      pc.onicecandidate = function(ev){
+        if (ev.candidate) mqttPublish(recvMqttClient, mqttTopic(code, 'recv'), code, { type: 'candidate', candidate: ev.candidate.toJSON() });
+      };
+      pc.ontrack = function(ev){
+        var st = ev.streams && ev.streams[0];
+        if (!st) return;
+        recvStreamSeen = true;
+        remoteStream = st;
+        var v = $('remoteVideo');
+        if (v.srcObject !== st) { v.srcObject = st; var p = v.play(); if (p && p.catch) p.catch(function(){}); }
+        $('recvEmpty').classList.add('hide');
+        $('recvHud').classList.add('show');
+        $('recvTools').classList.add('show');
+        $('recvStatus').innerHTML = '<strong>接続しました。</strong>（予備経路）';
+        requestWakeLock();
+        if (recvStatsTimer) clearInterval(recvStatsTimer);
+        $('recvStats').classList.add('show');
+        recvStatsTimer = startStats(pc, {
+          route: $('recvRoute'), fps: $('recvFps'), rtt: $('recvRtt'), res: $('recvRes'),
+          hud: { route: $('hudRoute'), fps: $('hudFps'), rtt: $('hudRtt'), res: $('hudRes') }
+        }, true);
+        if (recvWatchdog) clearTimeout(recvWatchdog);
+        recvWatchdog = setTimeout(function(){
+          recvWatchdog = null;
+          if (recvMqttPc !== pc || recvIceFailed) return;
+          if (!$('remoteVideo').videoWidth) {
+            showMsg($('recvFailMsg'), 'error', '映像トラックは届きましたが、映像フレームが来ていません。PC側で共有が止まっていないか確認してください。PC側は、iPadのコードはそのままで再接続できます。');
+            $('recvStatus').textContent = '映像が届いていません。';
+          }
+        }, 6000);
+      };
+      // 位置情報は DataChannel で受け取る
+      pc.ondatachannel = function(ev){
+        recvMqttDc = ev.channel;
+        recvMqttDc.onmessage = function(e){
+          try {
+            var d = JSON.parse(e.data);
+            if (d && d.type === 'pos' && POSITIONS.indexOf(d.pos) >= 0) setPosition(d.pos, false);
+          } catch (err) {}
+        };
+        recvMqttDc.onopen = function(){ setRecvNote('つながっています（予備経路）'); };
+        recvMqttDc.onclose = function(){ setRecvNote('閉じられました（映像の受信には影響しません）'); };
+      };
+      resetRecvPreviewStats(); resetRecvIceDiag();
+      $('recvDiag').classList.add('show');
+      if (recvDiag) recvDiag.stop();
+      var diag = attachIceDiag(pc, {
+        state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
+      }, {
+        onConnected: function(){ recvIceConnected = true; if (recvHelloTimer) { clearInterval(recvHelloTimer); recvHelloTimer = null; } },
+        onDisconnected: function(){
+          if (recvStreamSeen && !recvIceFailed) $('recvStatus').textContent = '接続が一時的に途切れました。自動で回復を待っています…';
+        },
+        onRecovered: function(){
+          if (recvStreamSeen && !recvIceFailed) $('recvStatus').innerHTML = '<strong>接続しました。</strong>（予備経路）';
+        },
+        onFailed: function(diagText){
+          recvIceFailed = true;
+          showMsg($('recvFailMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText + '\n（PC側は、iPadのコードはそのままで再接続できます）');
+          $('recvStatus').textContent = '接続できませんでした。';
+        }
+      });
+      recvDiag = diag;
+      pc.setRemoteDescription(new RTCSessionDescription(sdp)).then(function(){
+        recvMqttRemoteSet = true;
+        recvMqttPendingCands.forEach(function(c){ pc.addIceCandidate(new RTCIceCandidate(c)).catch(function(){}); });
+        recvMqttPendingCands = [];
+        return pc.createAnswer();
+      }).then(function(answer){
+        return pc.setLocalDescription(answer);
+      }).then(function(){
+        mqttPublish(recvMqttClient, mqttTopic(code, 'recv'), code, { type: 'answer', sdp: pc.localDescription });
+      }).catch(function(){
+        showMsg($('recvMsg'), 'error', '予備経路での応答に失敗しました。両側で最初からやり直してください。');
+      });
+    });
+  }
+
   function cleanupReceiver(){
+    teardownRecvMqtt();
+    recvMode = 'peerjs'; setRecvSig('標準', '—');
     recvGen++; // 生成途中の Peer があれば、その結果は破棄させる
     if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
     if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
