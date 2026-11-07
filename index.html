@@ -1,0 +1,917 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<link rel="icon" href="data:," />
+<title>iPadサブモニター GitHub版</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#0d1114;
+    --bg2:#12181c;
+    --panel:#171f24;
+    --panel2:#1c262c;
+    --line:#2a363d;
+    --line-soft:#223038;
+    --text:#eef4f2;
+    --muted:#9db0aa;
+    --muted2:#7e918b;
+    --accent:#63e6be;
+    --accent-ink:#06231a;
+    --accent-dim:#1d3a32;
+    --danger:#ff8a8a;
+    --danger-bg:#3a1f22;
+    --warn:#ffd38a;
+    --warn-bg:#38300f;
+    --radius:14px;
+    --radius-s:10px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:"Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans JP",system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+    line-height:1.55;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:18px 16px 40px}
+  /* role switch */
+  .role-switch{
+    display:grid;grid-template-columns:1fr 1fr;gap:0;
+    background:var(--bg2);border:1px solid var(--line);border-radius:999px;padding:4px;margin-bottom:16px;
+  }
+  .role-switch button{
+    appearance:none;border:0;background:transparent;color:var(--muted);
+    font-size:16px;font-weight:700;padding:11px 8px;border-radius:999px;cursor:pointer;
+  }
+  .role-switch button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
+  .role-switch button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  section.panel{
+    background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--radius);
+    padding:16px;margin-bottom:14px;
+  }
+  .panel h2{font-size:15px;margin:0 0 4px;font-weight:700}
+  .panel .hint{font-size:13px;color:var(--muted);margin:0 0 12px}
+
+  /* position grid */
+  .pos-row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+  .pos-grid{display:grid;grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,44px);gap:6px;flex:none}
+  .pos-grid button{
+    appearance:none;border:1px solid var(--line);background:var(--panel2);color:var(--text);
+    border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;padding:0;
+  }
+  .pos-grid button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+  .pos-grid .center{
+    display:flex;align-items:center;justify-content:center;border:1px dashed var(--line);
+    border-radius:8px;color:var(--muted2);font-size:12px;font-weight:700;background:transparent;
+  }
+  .pos-now{font-size:14px;padding-top:4px}
+  .pos-now strong{font-size:16px}
+  .pos-now .sub{font-size:12px;color:var(--muted);margin-top:4px;max-width:420px}
+
+  /* steps */
+  .step-head{display:flex;align-items:center;gap:10px;margin:0 0 10px}
+  .step-badge{
+    background:var(--accent);color:var(--accent-ink);font-size:12px;font-weight:800;
+    padding:3px 10px;border-radius:999px;white-space:nowrap;
+  }
+  .step-head h3{font-size:16px;margin:0}
+  .step{margin-bottom:18px}
+  .step:last-child{margin-bottom:0}
+
+  .choice-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .choice-row.three{grid-template-columns:repeat(3,1fr)}
+  .choice{
+    display:grid;grid-template-columns:20px 1fr;column-gap:6px;align-items:start;
+    border:1px solid var(--line);background:var(--panel2);border-radius:var(--radius-s);
+    padding:12px;cursor:pointer;
+  }
+  .choice input{
+    grid-row:1 / span 2;grid-column:1;width:17px;height:17px;margin:3px 0 0;
+    accent-color:var(--accent);cursor:pointer;flex:none;
+  }
+  .choice .t{font-weight:700;font-size:15px;display:block;grid-column:2}
+  .choice .d{font-size:12px;color:var(--muted);display:block;margin-top:2px;grid-column:2}
+  .choice:has(input:checked){border-color:var(--accent);background:var(--accent-dim)}
+  .choice:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+
+  .code-input-row{display:flex;gap:10px;flex-wrap:wrap}
+  .code-input{
+    flex:1 1 200px;background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius-s);
+    color:var(--text);font-size:28px;font-weight:800;letter-spacing:.35em;text-align:center;
+    padding:10px 8px 10px 14px;min-width:0;
+  }
+  .code-input::placeholder{letter-spacing:.2em;font-size:18px;color:var(--muted2);font-weight:600}
+  .code-input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}
+  .code-input.invalid{border-color:var(--danger)}
+
+  .btn{
+    appearance:none;border:1px solid var(--line);background:var(--panel2);color:var(--text);
+    font-size:15px;font-weight:700;padding:12px 18px;border-radius:var(--radius-s);cursor:pointer;
+  }
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .btn.small{padding:8px 12px;font-size:13px}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+
+  .msg{display:none;border-radius:var(--radius-s);padding:11px 13px;font-size:14px;margin-top:12px;white-space:pre-wrap;word-break:break-word}
+  .msg.show{display:block}
+  .msg.error{background:var(--danger-bg);color:#ffd7d7;border:1px solid #6b3438}
+  .msg.ok{background:var(--accent-dim);color:#c9f7e8;border:1px solid #2c5a4c}
+  .msg.info{background:var(--bg2);color:var(--muted);border:1px solid var(--line-soft)}
+  .msg.warn{background:var(--warn-bg);color:#ffe9bd;border:1px solid #6b5a1e}
+
+  .status-line{font-size:14px;color:var(--muted);margin-top:10px}
+  .status-line strong{color:var(--text)}
+
+  /* big code display (receiver) */
+  .big-code{
+    font-size:52px;font-weight:900;letter-spacing:.3em;text-align:center;
+    background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius-s);
+    padding:14px 6px 14px 20px;margin:4px 0 10px;line-height:1.2;
+  }
+  .big-code.waiting{font-size:16px;letter-spacing:0;font-weight:600;color:var(--muted);padding:22px 10px}
+
+  /* video stage */
+  .stage{
+    position:relative;background:#000;border-radius:var(--radius-s);overflow:hidden;
+    border:1px solid var(--line-soft);aspect-ratio:16/9;width:100%;
+  }
+  .stage video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+  .stage .stage-empty{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    color:var(--muted2);font-size:14px;text-align:center;padding:16px;
+  }
+  .stage .stage-empty.hide{display:none}
+  .hud{
+    position:absolute;left:10px;top:10px;display:none;flex-wrap:wrap;gap:6px;max-width:calc(100% - 20px);
+  }
+  .hud.show{display:flex}
+  .hud span{
+    background:rgba(8,12,14,.78);color:#dff5ec;font-size:12px;font-weight:700;
+    padding:4px 9px;border-radius:999px;border:1px solid rgba(255,255,255,.14);
+  }
+  .stage-tools{position:absolute;right:10px;bottom:10px;display:none;gap:8px}
+  .stage-tools.show{display:flex}
+  .stage-tools button{
+    appearance:none;border:1px solid rgba(255,255,255,.25);background:rgba(8,12,14,.8);color:#fff;
+    font-size:13px;font-weight:700;padding:8px 12px;border-radius:8px;cursor:pointer;
+  }
+  .stage:fullscreen{border-radius:0;border:0}
+  .stage:fullscreen video{object-fit:contain}
+
+  .stats-bar{
+    display:none;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--muted);margin-top:10px;
+  }
+  .stats-bar.show{display:flex}
+  .stats-bar b{color:var(--text);font-weight:700}
+
+  .hidden{display:none !important}
+  footer{margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  footer .note{font-size:12px;color:var(--muted2)}
+  a.dl{color:var(--accent);font-size:13px;font-weight:700;text-decoration:none}
+  a.dl:hover{text-decoration:underline}
+
+  @media (max-width:560px){
+    .choice-row.three{grid-template-columns:1fr}
+    .big-code{font-size:40px}
+    .code-input{font-size:24px}
+    .pos-grid{grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,42px)}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="role-switch" role="group" aria-label="役割の切り替え">
+    <button type="button" id="roleSend" aria-pressed="true">PCで送る</button>
+    <button type="button" id="roleRecv" aria-pressed="false">iPadで映す</button>
+  </div>
+
+  <!-- 位置指定（共通） -->
+  <section class="panel" aria-labelledby="posTitle">
+    <h2 id="posTitle">iPadの位置</h2>
+    <p class="hint">PC画面を中心に、iPadを置く方向を選びます。</p>
+    <div class="pos-row">
+      <div class="pos-grid" id="posGrid" role="group" aria-label="iPadの位置（3×3）"></div>
+      <div class="pos-now">
+        現在の位置：<strong id="posNow">左</strong>
+        <div class="sub">接続すると、iPad側の画面にもこの位置が表示されます。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 送信側（PC） ============ -->
+  <div id="sendView">
+    <section class="panel">
+      <div class="step">
+        <div class="step-head"><span class="step-badge">手順 1</span><h3>共有する対象</h3></div>
+        <div class="choice-row" role="radiogroup" aria-label="共有する対象">
+          <label class="choice">
+            <input type="radio" name="target" value="window" checked />
+            <span class="t">ウィンドウ</span>
+            <span class="d">1つのアプリの画面だけを送ります</span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="target" value="screen" />
+            <span class="t">デスクトップ全体</span>
+            <span class="d">画面全体を送ります</span>
+          </label>
+        </div>
+        <div class="msg" id="targetMsg" role="alert"></div>
+      </div>
+
+      <div class="step">
+        <div class="step-head"><span class="step-badge">手順 2</span><h3>画質</h3></div>
+        <div class="choice-row three" role="radiogroup" aria-label="画質">
+          <label class="choice">
+            <input type="radio" name="quality" value="text" checked />
+            <span class="t">文字優先</span>
+            <span class="d">約3.5Mbps・文字をくっきり</span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="quality" value="balanced" />
+            <span class="t">バランス</span>
+            <span class="d">約3Mbps</span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="quality" value="motion" />
+            <span class="t">動き優先</span>
+            <span class="d">約5Mbps・なめらかさ重視</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-head"><span class="step-badge">手順 3</span><h3>iPadのコードを入力</h3></div>
+        <div class="code-input-row">
+          <input class="code-input" id="codeInput" type="text" inputmode="numeric" autocomplete="off"
+                 maxlength="6" placeholder="6桁コード" aria-label="iPadに表示された6桁コード" />
+          <button class="btn primary" id="connectBtn" type="button">接続する</button>
+        </div>
+        <div class="msg" id="sendMsg" role="alert"></div>
+        <div class="status-line" id="sendStatus">iPad側で表示された6桁コードを入力してください。</div>
+      </div>
+    </section>
+
+    <section class="panel" id="sendPreviewPanel">
+      <h2>送信中の画面</h2>
+      <div class="stage" id="sendStage">
+        <video id="localVideo" autoplay muted playsinline></video>
+        <div class="stage-empty" id="sendEmpty">まだ送信していません</div>
+      </div>
+      <div class="stats-bar" id="sendStats">
+        <span>経路 <b id="sendRoute">—</b></span>
+        <span>フレームレート <b id="sendFps">—</b></span>
+        <span>遅延 <b id="sendRtt">—</b></span>
+        <span>解像度 <b id="sendRes">—</b></span>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="sendResetBtn" type="button">最初からやり直す</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ============ 受信側（iPad） ============ -->
+  <div id="recvView" class="hidden">
+    <section class="panel">
+      <div class="step">
+        <div class="step-head"><span class="step-badge">手順 1</span><h3>このコードをPCに入力</h3></div>
+        <div class="big-code waiting" id="bigCode">コードを用意しています…</div>
+        <div class="btn-row" style="margin-top:0">
+          <button class="btn small" id="copyCodeBtn" type="button" disabled>コードをコピー</button>
+        </div>
+        <div class="msg" id="recvMsg" role="alert"></div>
+        <div class="status-line" id="recvStatus">PCからの接続を待っています。</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>受信中の画面</h2>
+      <div class="stage" id="recvStage">
+        <video id="remoteVideo" autoplay playsinline></video>
+        <div class="stage-empty" id="recvEmpty">まだ映像は届いていません</div>
+        <div class="hud" id="recvHud">
+          <span id="hudPos">位置：—</span>
+          <span id="hudRoute">経路：—</span>
+          <span id="hudFps">— fps</span>
+          <span id="hudRtt">遅延 —</span>
+          <span id="hudRes">—</span>
+        </div>
+        <div class="stage-tools" id="recvTools">
+          <button type="button" id="fsBtn">全画面</button>
+        </div>
+      </div>
+      <div class="stats-bar" id="recvStats">
+        <span>経路 <b id="recvRoute">—</b></span>
+        <span>フレームレート <b id="recvFps">—</b></span>
+        <span>遅延 <b id="recvRtt">—</b></span>
+        <span>解像度 <b id="recvRes">—</b></span>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="recvResetBtn" type="button">最初からやり直す</button>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <a class="dl" href="#" id="downloadHtml">このページを index.html として保存</a>
+    <span class="note">保存したファイルを GitHub Pages の index.html として置けます。</span>
+  </footer>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  /* ================= 設定 ================= */
+  var PEER_PREFIX = 'smgh-v1-';
+  var ICE_CONFIG = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+    ],
+    iceCandidatePoolSize: 10
+  };
+  var QUALITY = {
+    text:     { bitrate: 3500000, hint: 'text',   label: '文字優先' },
+    balanced: { bitrate: 3000000, hint: 'detail', label: 'バランス' },
+    motion:   { bitrate: 5000000, hint: 'motion', label: '動き優先' }
+  };
+  var POSITIONS = ['左上','上','右上','左',null,'右','左下','下','右下'];
+
+  /* ================= 状態 ================= */
+  var role = 'send';           // 'send' | 'recv'
+  var position = '左';
+  try {
+    var savedPos = window.localStorage.getItem('sm-gh-pos');
+    if (savedPos && POSITIONS.indexOf(savedPos) >= 0) position = savedPos;
+  } catch (e) { /* 保存できない環境ではメモリ内のみ */ }
+
+  // 送信側
+  var sendPeer = null, sendCall = null, sendConn = null, localStream = null, sendStatsTimer = null;
+  var sending = false;
+
+  // 受信側
+  var recvPeer = null, recvCall = null, recvConn = null, recvCode = null, recvRetry = 0;
+  var remoteStream = null, recvStatsTimer = null, wakeLock = null;
+
+  /* ================= DOM ================= */
+  function $(id){ return document.getElementById(id); }
+  var roleSendBtn = $('roleSend'), roleRecvBtn = $('roleRecv');
+  var sendView = $('sendView'), recvView = $('recvView');
+
+  function showMsg(el, kind, text){
+    el.className = 'msg show ' + kind;
+    el.textContent = text;
+  }
+  function hideMsg(el){
+    el.className = 'msg';
+    el.textContent = '';
+  }
+
+  /* ================= 位置グリッド ================= */
+  var posGrid = $('posGrid');
+  POSITIONS.forEach(function(p){
+    if (p === null) {
+      var c = document.createElement('div');
+      c.className = 'center';
+      c.textContent = 'PC';
+      posGrid.appendChild(c);
+      return;
+    }
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = p;
+    b.setAttribute('aria-pressed', p === position ? 'true' : 'false');
+    b.addEventListener('click', function(){ setPosition(p, true); });
+    b.dataset.pos = p;
+    posGrid.appendChild(b);
+  });
+
+  function setPosition(p, notify){
+    position = p;
+    $('posNow').textContent = p;
+    var btns = posGrid.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].dataset.pos === p ? 'true' : 'false');
+    }
+    try { window.localStorage.setItem('sm-gh-pos', p); } catch (e) {}
+    $('hudPos').textContent = '位置：' + p;
+    if (notify && sendConn && sendConn.open) {
+      try { sendConn.send({ type: 'pos', pos: p }); } catch (e) {}
+    }
+  }
+  setPosition(position, false);
+
+  /* ================= 役割切り替え ================= */
+  function setRole(r){
+    if (r === role && (r === 'send' ? true : !!recvPeer)) { /* そのまま */ }
+    role = r;
+    roleSendBtn.setAttribute('aria-pressed', r === 'send' ? 'true' : 'false');
+    roleRecvBtn.setAttribute('aria-pressed', r === 'recv' ? 'true' : 'false');
+    sendView.classList.toggle('hidden', r !== 'send');
+    recvView.classList.toggle('hidden', r !== 'recv');
+    if (r === 'recv') { startReceiver(); requestWakeLock(); }
+    if (r === 'send') { /* 受信ピアは維持（戻ったときにコード再利用） */ }
+  }
+  roleSendBtn.addEventListener('click', function(){ setRole('send'); });
+  roleRecvBtn.addEventListener('click', function(){ setRole('recv'); });
+
+  /* ================= 共通: PeerJS 読み込み確認 ================= */
+  function peerJsReady(){
+    return typeof window.Peer !== 'undefined';
+  }
+  function newPeer(id){
+    var opts = {
+      host: '0.peerjs.com',
+      port: 443,
+      path: '/',
+      secure: true,
+      debug: 0,
+      config: ICE_CONFIG
+    };
+    return id ? new window.Peer(id, opts) : new window.Peer(opts);
+  }
+  function peerErrorText(err){
+    var t = err && err.type ? err.type : '';
+    switch (t) {
+      case 'peer-unavailable': return 'そのコードの相手が見つかりませんでした。iPad側に表示されているコードと一致しているか確認してください。';
+      case 'unavailable-id':   return 'そのコードは使用中でした。別のコードで作り直します。';
+      case 'network':          return '接続サーバーへ届きませんでした。ネットワーク接続を確認して、最初からやり直してください。';
+      case 'server-error':     return '接続サーバーでエラーが発生しました。少し待って、最初からやり直してください。';
+      case 'browser-incompatible': return 'このブラウザは映像接続（WebRTC）に対応していません。最新のSafari / Chromeで開いてください。';
+      case 'invalid-id':       return 'コードの形式が正しくありません。6桁の数字を入力してください。';
+      case 'ssl-unavailable':  return '安全な接続（HTTPS）が使えません。httpsのURLで開いてください。';
+      default: return '接続でエラーが発生しました' + (t ? '（' + t + '）' : '') + '。最初からやり直してください。';
+    }
+  }
+
+  /* ================= 統計（経路 / fps / 遅延 / 解像度） ================= */
+  function startStats(pc, els, isReceiver){
+    var prevFrames = null, prevTime = null;
+    function tick(){
+      if (!pc || pc.connectionState === 'closed') return;
+      pc.getStats(null).then(function(report){
+        var pair = null, localCand = {}, remoteCand = {}, videoRtp = null;
+        report.forEach(function(s){
+          if (s.type === 'local-candidate') localCand[s.id] = s;
+          if (s.type === 'remote-candidate') remoteCand[s.id] = s;
+          if (s.type === 'candidate-pair' && s.nominated && (s.state === 'succeeded' || s.state === 'in-progress')) {
+            if (!pair || s.state === 'succeeded') pair = s;
+          }
+          if (isReceiver && s.type === 'inbound-rtp' && (s.kind === 'video' || s.mediaType === 'video')) videoRtp = s;
+          if (!isReceiver && s.type === 'outbound-rtp' && (s.kind === 'video' || s.mediaType === 'video')) videoRtp = s;
+        });
+        // 経路
+        var route = '—';
+        if (pair) {
+          var lc = localCand[pair.localCandidateId], rc = remoteCand[pair.remoteCandidateId];
+          var types = [lc && lc.candidateType, rc && rc.candidateType];
+          route = (types.indexOf('relay') >= 0) ? '中継' : '直接';
+        }
+        // 遅延
+        var rtt = '—';
+        if (pair && typeof pair.currentRoundTripTime === 'number') {
+          rtt = Math.round(pair.currentRoundTripTime * 1000) + ' ms';
+        }
+        // fps（フレーム数の差分から算出）
+        var fps = '—';
+        if (videoRtp) {
+          var frames = isReceiver ? videoRtp.framesDecoded : videoRtp.framesEncoded;
+          var now = performance.now();
+          if (typeof frames === 'number') {
+            if (prevFrames !== null && now > prevTime) {
+              fps = Math.round((frames - prevFrames) / ((now - prevTime) / 1000)) + ' fps';
+            } else if (typeof videoRtp.framesPerSecond === 'number') {
+              fps = Math.round(videoRtp.framesPerSecond) + ' fps';
+            }
+            prevFrames = frames; prevTime = now;
+          }
+        }
+        // 解像度
+        var res = '—';
+        if (videoRtp && videoRtp.frameWidth && videoRtp.frameHeight) {
+          res = videoRtp.frameWidth + '×' + videoRtp.frameHeight;
+        }
+        els.route.textContent = route;
+        els.fps.textContent = fps;
+        els.rtt.textContent = rtt;
+        els.res.textContent = res;
+        if (els.hud) {
+          els.hud.route.textContent = '経路：' + route;
+          els.hud.fps.textContent = fps === '—' ? '— fps' : fps;
+          els.hud.rtt.textContent = '遅延 ' + rtt;
+          els.hud.res.textContent = res;
+        }
+      }).catch(function(){ /* 統計が取れない間は前回表示を維持 */ });
+    }
+    tick();
+    return setInterval(tick, 3000);
+  }
+
+  /* =====================================================
+     送信側（PC）
+  ===================================================== */
+  var codeInput = $('codeInput');
+  codeInput.addEventListener('input', function(){
+    var v = codeInput.value.replace(/[^0-9]/g, '').slice(0, 6);
+    codeInput.value = v;
+    if (v.length === 6) { codeInput.classList.remove('invalid'); hideMsg($('sendMsg')); }
+  });
+
+  function selectedQuality(){
+    var q = document.querySelector('input[name="quality"]:checked');
+    return q ? q.value : 'text';
+  }
+  function selectedTarget(){
+    var t = document.querySelector('input[name="target"]:checked');
+    return t ? t.value : 'window';
+  }
+
+  function applySenderParams(){
+    if (!sendCall || !sendCall.peerConnection) return;
+    var pc = sendCall.peerConnection;
+    var senders = pc.getSenders ? pc.getSenders() : [];
+    var q = QUALITY[selectedQuality()];
+    senders.forEach(function(sender){
+      if (!sender.track || sender.track.kind !== 'video') return;
+      var params = sender.getParameters ? sender.getParameters() : {};
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      params.encodings[0].maxBitrate = q.bitrate;
+      params.encodings[0].maxFramerate = 30;
+      // 1080pを超える場合は自動で縮小
+      var st = sender.track.getSettings ? sender.track.getSettings() : {};
+      var scale = 1;
+      if (st.width && st.height) {
+        scale = Math.max(st.width / 1920, st.height / 1080);
+        if (scale < 1) scale = 1;
+      }
+      params.encodings[0].scaleResolutionDownBy = scale;
+      params.degradationPreference = selectedQuality() === 'motion' ? 'maintain-framerate' : 'maintain-resolution';
+      sender.setParameters(params).catch(function(){ /* 未対応環境ではそのまま */ });
+    });
+  }
+
+  $('connectBtn').addEventListener('click', function(){
+    hideMsg($('sendMsg')); hideMsg($('targetMsg'));
+    if (sending) return;
+
+    var code = codeInput.value.trim();
+    if (!/^[0-9]{6}$/.test(code)) {
+      codeInput.classList.add('invalid');
+      showMsg($('sendMsg'), 'error', 'コードは6桁の数字で入力してください。iPad側の画面に表示されているコードを確認してください。');
+      codeInput.focus();
+      return;
+    }
+    if (!peerJsReady()) {
+      showMsg($('sendMsg'), 'error', '接続用ライブラリ（PeerJS）を読み込めませんでした。ネットワーク接続を確認して、ページを再読み込みしてください。');
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      showMsg($('targetMsg'), 'error', 'このブラウザでは画面共有が使えません。PCのChrome / Edgeで開いてください。');
+      return;
+    }
+
+    var target = selectedTarget();
+    var qKey = selectedQuality();
+    var q = QUALITY[qKey];
+
+    var videoConstraints = {
+      width: { max: 1920 },
+      height: { max: 1080 },
+      frameRate: { ideal: 30, min: 20, max: 30 }
+    };
+    // 対象の希望（対応ブラウザでのみ効く補助指定。選択画面自体はブラウザが表示する）
+    try { videoConstraints.displaySurface = target === 'screen' ? 'monitor' : 'window'; } catch (e) {}
+
+    $('sendStatus').innerHTML = '画面の選択画面を開いています…';
+    navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: false })
+    .then(function(stream){
+      localStream = stream;
+      var track = stream.getVideoTracks()[0];
+      if (track) {
+        try { track.contentHint = q.hint; } catch (e) {}
+        track.addEventListener('ended', function(){
+          if (sending) {
+            showMsg($('sendMsg'), 'warn', '画面共有が停止しました。もう一度つなぐ場合は「最初からやり直す」を押してください。');
+            $('sendStatus').textContent = '共有が停止しました。';
+          }
+        });
+      }
+      var lv = $('localVideo');
+      lv.srcObject = stream;
+      $('sendEmpty').classList.add('hide');
+      startSendPeer(code);
+    })
+    .catch(function(err){
+      if (err && err.name === 'NotAllowedError') {
+        showMsg($('targetMsg'), 'error', '画面共有が許可されませんでした。接続するときに、共有する' + (target === 'screen' ? '画面' : 'ウィンドウ') + 'を選んで許可してください。');
+      } else if (err && err.name === 'NotFoundError') {
+        showMsg($('targetMsg'), 'error', '共有できる画面が見つかりませんでした。対象のウィンドウを開いてから、もう一度試してください。');
+      } else {
+        showMsg($('targetMsg'), 'error', '画面を取得できませんでした' + (err && err.name ? '（' + err.name + '）' : '') + '。もう一度試してください。');
+      }
+      $('sendStatus').textContent = 'iPad側で表示された6桁コードを入力してください。';
+    });
+  });
+
+  function startSendPeer(code){
+    sending = true;
+    $('connectBtn').disabled = true;
+    $('sendStatus').innerHTML = '接続しています…（コード <strong>' + code + '</strong>）';
+    var remoteId = PEER_PREFIX + code;
+    sendPeer = newPeer(null);
+    var opened = false;
+
+    sendPeer.on('open', function(){
+      opened = true;
+      // データ接続（位置の共有用）
+      try {
+        sendConn = sendPeer.connect(remoteId, { reliable: true });
+        sendConn.on('open', function(){
+          try { sendConn.send({ type: 'pos', pos: position }); } catch (e) {}
+        });
+        sendConn.on('error', function(){ /* 映像が本線。位置共有の失敗は握り潰さず状態欄へ */ 
+          $('sendStatus').textContent = '映像は接続中ですが、位置の共有に失敗しました。';
+        });
+      } catch (e) {}
+
+      // 映像発信
+      sendCall = sendPeer.call(remoteId, localStream);
+      if (!sendCall) {
+        failSend('発信を開始できませんでした。最初からやり直してください。');
+        return;
+      }
+      // 送信パラメータ（ビットレート等）は接続直後と安定後に適用
+      setTimeout(applySenderParams, 800);
+      setTimeout(applySenderParams, 3000);
+      watchSendConnection();
+    });
+
+    sendPeer.on('error', function(err){
+      if (err && err.type === 'peer-unavailable') {
+        failSend('コード「' + code + '」のiPadが見つかりませんでした。iPad側で「iPadで映す」を開いてコードが表示されていること、数字が一致していることを確認してください。');
+      } else if (!opened) {
+        failSend(peerErrorText(err));
+      } else {
+        showMsg($('sendMsg'), 'error', peerErrorText(err));
+      }
+    });
+    sendPeer.on('disconnected', function(){
+      if (sending) showMsg($('sendMsg'), 'warn', '接続サーバーから切断されました。映像が止まる場合は「最初からやり直す」を押してください。');
+    });
+  }
+
+  function watchSendConnection(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      if (!sendCall || !sendCall.peerConnection) { if (tries > 20) clearInterval(iv); return; }
+      var pc = sendCall.peerConnection;
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        clearInterval(iv);
+        $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。';
+        showMsg($('sendMsg'), 'ok', '接続しました。');
+        applySenderParams();
+        if (sendStatsTimer) clearInterval(sendStatsTimer);
+        $('sendStats').classList.add('show');
+        sendStatsTimer = startStats(pc, {
+          route: $('sendRoute'), fps: $('sendFps'), rtt: $('sendRtt'), res: $('sendRes')
+        }, false);
+      } else if (pc.iceConnectionState === 'failed') {
+        clearInterval(iv);
+        failSend('映像の通り道を作れませんでした。PCとiPadのネットワークを確認して、最初からやり直してください（別回線同士の場合は中継を試みますが、回線側で遮断されていると接続できません）。');
+      } else if (pc.iceConnectionState === 'closed') {
+        clearInterval(iv);
+      }
+      if (tries > 30) clearInterval(iv); // 約30秒で監視終了（状態表示は維持）
+    }, 1000);
+  }
+
+  function failSend(text){
+    showMsg($('sendMsg'), 'error', text);
+    $('sendStatus').textContent = '接続できませんでした。';
+    cleanupSend(true);
+  }
+
+  function cleanupSend(keepMessage){
+    sending = false;
+    $('connectBtn').disabled = false;
+    if (sendStatsTimer) { clearInterval(sendStatsTimer); sendStatsTimer = null; }
+    if (sendCall) { try { sendCall.close(); } catch (e) {} sendCall = null; }
+    if (sendConn) { try { sendConn.close(); } catch (e) {} sendConn = null; }
+    if (sendPeer) { try { sendPeer.destroy(); } catch (e) {} sendPeer = null; }
+    if (localStream) {
+      localStream.getTracks().forEach(function(t){ try { t.stop(); } catch (e) {} });
+      localStream = null;
+    }
+    $('localVideo').srcObject = null;
+    $('sendEmpty').classList.remove('hide');
+    $('sendStats').classList.remove('show');
+    if (!keepMessage) {
+      hideMsg($('sendMsg')); hideMsg($('targetMsg'));
+      $('sendStatus').textContent = 'iPad側で表示された6桁コードを入力してください。';
+    }
+  }
+  $('sendResetBtn').addEventListener('click', function(){ cleanupSend(false); });
+
+  /* =====================================================
+     受信側（iPad）
+  ===================================================== */
+  function randomCode(){
+    return String(Math.floor(100000 + Math.random() * 900000));
+  }
+
+  function startReceiver(){
+    if (recvPeer) return; // 既にコード発行済み
+    hideMsg($('recvMsg'));
+    if (!peerJsReady()) {
+      $('bigCode').textContent = '読み込みに失敗しました';
+      $('bigCode').classList.add('waiting');
+      showMsg($('recvMsg'), 'error', '接続用ライブラリ（PeerJS）を読み込めませんでした。ネットワーク接続を確認して、ページを再読み込みしてください。');
+      return;
+    }
+    recvRetry = 0;
+    createReceiverPeer();
+  }
+
+  function createReceiverPeer(){
+    recvCode = randomCode();
+    recvPeer = newPeer(PEER_PREFIX + recvCode);
+
+    recvPeer.on('open', function(id){
+      $('bigCode').textContent = recvCode;
+      $('bigCode').classList.remove('waiting');
+      $('copyCodeBtn').disabled = false;
+      $('recvStatus').textContent = 'PCからの接続を待っています。PC側でこのコードを入力してください。';
+    });
+
+    recvPeer.on('connection', function(conn){
+      recvConn = conn;
+      conn.on('data', function(data){
+        if (data && data.type === 'pos' && POSITIONS.indexOf(data.pos) >= 0) {
+          setPosition(data.pos, false);
+        }
+      });
+      conn.on('error', function(){
+        showMsg($('recvMsg'), 'warn', 'PCとの補助接続でエラーが発生しました（映像の受信には影響しない場合があります）。');
+      });
+    });
+
+    recvPeer.on('call', function(call){
+      recvCall = call;
+      hideMsg($('recvMsg'));
+      $('recvStatus').textContent = 'PCから接続がありました。映像を待っています…';
+      call.answer(); // 受信側は映像を送らない
+      call.on('stream', function(stream){
+        remoteStream = stream;
+        var v = $('remoteVideo');
+        v.srcObject = stream;
+        var p = v.play(); if (p && p.catch) p.catch(function(){});
+        $('recvEmpty').classList.add('hide');
+        $('recvHud').classList.add('show');
+        $('recvTools').classList.add('show');
+        $('recvStatus').innerHTML = '<strong>接続しました。</strong>';
+        requestWakeLock();
+        if (recvStatsTimer) clearInterval(recvStatsTimer);
+        $('recvStats').classList.add('show');
+        if (call.peerConnection) {
+          recvStatsTimer = startStats(call.peerConnection, {
+            route: $('recvRoute'), fps: $('recvFps'), rtt: $('recvRtt'), res: $('recvRes'),
+            hud: { route: $('hudRoute'), fps: $('hudFps'), rtt: $('hudRtt'), res: $('hudRes') }
+          }, true);
+          watchRecvConnection(call.peerConnection);
+        }
+      });
+      call.on('close', function(){
+        showMsg($('recvMsg'), 'warn', 'PC側の送信が終了しました。再接続する場合は両側で「最初からやり直す」を押してください。');
+        $('recvStatus').textContent = '切断されました。';
+      });
+      call.on('error', function(err){
+        showMsg($('recvMsg'), 'error', '受信でエラーが発生しました' + (err && err.type ? '（' + err.type + '）' : '') + '。両側で最初からやり直してください。');
+      });
+    });
+
+    recvPeer.on('error', function(err){
+      if (err && err.type === 'unavailable-id' && recvRetry < 5) {
+        // コード衝突: 別コードで再発行
+        recvRetry++;
+        try { recvPeer.destroy(); } catch (e) {}
+        recvPeer = null;
+        createReceiverPeer();
+        return;
+      }
+      showMsg($('recvMsg'), 'error', peerErrorText(err));
+      $('recvStatus').textContent = '接続の待受に失敗しました。';
+    });
+    recvPeer.on('disconnected', function(){
+      showMsg($('recvMsg'), 'warn', '接続サーバーから切断されました。「最初からやり直す」を押してコードを作り直してください。');
+    });
+  }
+
+  function watchRecvConnection(pc){
+    var iv = setInterval(function(){
+      if (!recvCall) { clearInterval(iv); return; }
+      if (pc.iceConnectionState === 'failed') {
+        clearInterval(iv);
+        showMsg($('recvMsg'), 'error', '映像の通り道を作れませんでした。iPadとPCのネットワークを確認して、両側で最初からやり直してください（別回線同士の場合は中継を試みますが、回線側で遮断されていると接続できません）。');
+        $('recvStatus').textContent = '接続できませんでした。';
+      } else if (pc.iceConnectionState === 'closed' || pc.iceConnectionState === 'disconnected') {
+        clearInterval(iv);
+      }
+    }, 1500);
+  }
+
+  $('copyCodeBtn').addEventListener('click', function(){
+    if (!recvCode) return;
+    var done = function(){
+      $('copyCodeBtn').textContent = 'コピーしました';
+      setTimeout(function(){ $('copyCodeBtn').textContent = 'コードをコピー'; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(recvCode).then(done).catch(function(){
+        showMsg($('recvMsg'), 'info', 'コピーできませんでした。コード「' + recvCode + '」を手で入力してください。');
+      });
+    } else {
+      showMsg($('recvMsg'), 'info', 'このブラウザではコピーできません。コード「' + recvCode + '」を手で入力してください。');
+    }
+  });
+
+  function cleanupReceiver(){
+    if (recvStatsTimer) { clearInterval(recvStatsTimer); recvStatsTimer = null; }
+    if (recvCall) { try { recvCall.close(); } catch (e) {} recvCall = null; }
+    if (recvConn) { try { recvConn.close(); } catch (e) {} recvConn = null; }
+    if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+    remoteStream = null;
+    $('remoteVideo').srcObject = null;
+    $('recvEmpty').classList.remove('hide');
+    $('recvHud').classList.remove('show');
+    $('recvTools').classList.remove('show');
+    $('recvStats').classList.remove('show');
+    $('bigCode').textContent = 'コードを用意しています…';
+    $('bigCode').classList.add('waiting');
+    $('copyCodeBtn').disabled = true;
+    hideMsg($('recvMsg'));
+    $('recvStatus').textContent = 'PCからの接続を待っています。';
+    if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+  }
+  $('recvResetBtn').addEventListener('click', function(){
+    cleanupReceiver();
+    startReceiver();
+  });
+
+  /* 全画面 & Wake Lock */
+  $('fsBtn').addEventListener('click', function(){
+    var stage = $('recvStage');
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(function(){});
+    } else if (stage.requestFullscreen) {
+      stage.requestFullscreen().catch(function(){
+        showMsg($('recvMsg'), 'warn', '全画面にできませんでした。このブラウザでは全画面表示が制限されています。');
+      });
+    } else {
+      var v = $('remoteVideo');
+      if (v.webkitEnterFullscreen) v.webkitEnterFullscreen();
+    }
+  });
+
+  function requestWakeLock(){
+    if (!('wakeLock' in navigator)) return;
+    if (role !== 'recv') return;
+    navigator.wakeLock.request('screen').then(function(lock){
+      wakeLock = lock;
+      lock.addEventListener('release', function(){ wakeLock = null; });
+    }).catch(function(){ /* 取得できない環境では無視（表示に影響なし） */ });
+  }
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible' && role === 'recv' && remoteStream) requestWakeLock();
+  });
+
+  /* ================= index.html として保存 ================= */
+  $('downloadHtml').addEventListener('click', function(ev){
+    ev.preventDefault();
+    var html = '<!doctype html>\n' + document.documentElement.outerHTML;
+    var blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'index.html';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
+  });
+})();
+</script>
+</body>
+</html>
