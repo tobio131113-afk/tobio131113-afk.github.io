@@ -279,11 +279,15 @@
         <span>遅延 <b id="sendRtt">—</b></span>
         <span>解像度 <b id="sendRes">—</b></span>
       </div>
+      <div class="msg" id="sendFailMsg" role="alert"></div>
       <div class="diag-bar" id="sendDiag">
         <span>ICE状態 <b id="sendIceState">—</b></span>
         <span>自分の候補 <b id="sendLocalCand">—</b></span>
         <span>相手の候補 <b id="sendRemoteCand">—</b></span>
         <span>選択ペア <b id="sendPair">—</b></span>
+      </div>
+      <div class="diag-bar" id="sendNoteBar">
+        <span>補助接続（位置の共有） <b id="sendNote">—</b></span>
       </div>
       <div class="btn-row">
         <button class="btn" id="sendResetBtn" type="button">最初からやり直す</button>
@@ -327,11 +331,15 @@
         <span>遅延 <b id="recvRtt">—</b></span>
         <span>解像度 <b id="recvRes">—</b></span>
       </div>
+      <div class="msg" id="recvFailMsg" role="alert"></div>
       <div class="diag-bar" id="recvDiag">
         <span>ICE状態 <b id="recvIceState">—</b></span>
         <span>自分の候補 <b id="recvLocalCand">—</b></span>
         <span>相手の候補 <b id="recvRemoteCand">—</b></span>
         <span>選択ペア <b id="recvPair">—</b></span>
+      </div>
+      <div class="diag-bar" id="recvNoteBar">
+        <span>補助接続（位置の共有） <b id="recvNote">—</b></span>
       </div>
       <div class="btn-row">
         <button class="btn" id="recvResetBtn" type="button">最初からやり直す</button>
@@ -387,10 +395,12 @@
   // 送信側
   var sendPeer = null, sendCall = null, sendConn = null, localStream = null, sendStatsTimer = null;
   var sending = false, sendDiag = null;
+  var sendIceConnected = false, sendIceFailed = false;
 
   // 受信側
   var recvPeer = null, recvCall = null, recvConn = null, recvCode = null, recvRetry = 0;
   var remoteStream = null, recvStatsTimer = null, wakeLock = null, recvDiag = null;
+  var recvIceConnected = false, recvIceFailed = false, recvStreamSeen = false, recvWatchdog = null;
 
   /* ================= DOM ================= */
   function $(id){ return document.getElementById(id); }
@@ -404,6 +414,20 @@
   function hideMsg(el){
     el.className = 'msg';
     el.textContent = '';
+  }
+  // 補助接続（位置の共有）の状態は、本線のバナーとは別の小さな診断欄にだけ出す。
+  // 補助接続の失敗が映像側の表示（接続状態・失敗診断）を上書きしないための分離。
+  function setSendNote(text){
+    var bar = $('sendNoteBar');
+    if (!text) { bar.classList.remove('show'); return; }
+    $('sendNote').textContent = text;
+    bar.classList.add('show');
+  }
+  function setRecvNote(text){
+    var bar = $('recvNoteBar');
+    if (!text) { bar.classList.remove('show'); return; }
+    $('recvNote').textContent = text;
+    bar.classList.add('show');
   }
 
   /* ================= 位置グリッド ================= */
@@ -555,6 +579,7 @@
   function attachIceDiag(pc, ui, handlers){
     var localTypes = {}, remoteTypes = {}, selectedPair = null;
     var connectedFired = false, failedFired = false, timer = null;
+    var discTimer = null, discNotified = false;
 
     function typesText(map){
       var order = ['host', 'srflx', 'prflx', 'relay'], out = [];
@@ -592,15 +617,43 @@
     function onState(){
       render();
       var s = pc.iceConnectionState;
-      if ((s === 'connected' || s === 'completed') && !connectedFired) {
-        connectedFired = true;
-        if (handlers.onConnected) handlers.onConnected();
+      if (s === 'connected' || s === 'completed') {
+        if (discTimer) { clearTimeout(discTimer); discTimer = null; }
+        discNotified = false;
+        if (!connectedFired) {
+          connectedFired = true;
+          if (handlers.onConnected) handlers.onConnected();
+        } else if (handlers.onRecovered) {
+          handlers.onRecovered();
+        }
+      }
+      if (s === 'disconnected' && !failedFired) {
+        // disconnected は一時的なことも多いので、即失敗とはせず回復を待つ。
+        // ただし iOS Safari では failed に進まず disconnected のまま
+        // 通話が閉じられることがあるため、8秒回復しなければ診断を出す。
+        if (handlers.onDisconnected && !discNotified) {
+          discNotified = true;
+          handlers.onDisconnected();
+        }
+        if (!discTimer) {
+          discTimer = setTimeout(function(){
+            discTimer = null;
+            if (failedFired) return;
+            var now = pc.iceConnectionState;
+            if (now === 'disconnected' || now === 'checking') {
+              failedFired = true;
+              if (handlers.onFailed) handlers.onFailed(diagnose() + '（接続状態が「一時切断（disconnected）」のまま回復しませんでした）');
+            }
+          }, 8000);
+        }
       }
       if (s === 'failed' && !failedFired) {
         failedFired = true;
+        if (discTimer) { clearTimeout(discTimer); discTimer = null; }
         // failed 直後は候補情報が最終状態でないことがあるため、一拍置いて診断する
         setTimeout(function(){ if (handlers.onFailed) handlers.onFailed(diagnose()); }, 600);
       }
+      if (s === 'closed' && discTimer) { clearTimeout(discTimer); discTimer = null; }
     }
     function tickStats(){
       if (pc.connectionState === 'closed') { if (timer) clearInterval(timer); return; }
@@ -626,9 +679,13 @@
     return {
       stop: function(){
         if (timer) clearInterval(timer);
+        if (discTimer) { clearTimeout(discTimer); discTimer = null; }
         try { pc.removeEventListener('icecandidate', onCand); } catch (e) {}
         try { pc.removeEventListener('iceconnectionstatechange', onState); } catch (e) {}
-      }
+      },
+      // failed イベントを経ずに通話が閉じられた場合でも、その時点の候補情報から診断文を作る
+      diagnoseNow: diagnose,
+      wasConnected: function(){ return connectedFired; }
     };
   }
 
@@ -722,6 +779,9 @@
     // 判定（transient activation）が切れて、選択画面が出ずに落ちることがあるため、
     // Peer接続はキャプチャ取得後に回す。
     hideMsg($('sendMsg')); hideMsg($('targetMsg'));
+    hideMsg($('sendFailMsg')); setSendNote(null);
+    sendIceConnected = false; sendIceFailed = false;
+    $('sendDiag').classList.remove('show');
     if (sending) return;
 
     var code = codeInput.value.trim();
@@ -822,18 +882,18 @@
 
     sendPeer.on('open', function(){
       opened = true;
-      // データ接続（位置の共有用）
-      try {
-        sendConn = sendPeer.connect(remoteId, { reliable: true });
-        sendConn.on('open', function(){
-          try { sendConn.send({ type: 'pos', pos: position }); } catch (e) {}
-        });
-        sendConn.on('error', function(){ /* 映像が本線。位置共有の失敗は握り潰さず状態欄へ */ 
-          $('sendStatus').textContent = '映像は接続中ですが、位置の共有に失敗しました。';
-        });
-      } catch (e) {}
+      sendIceConnected = false; sendIceFailed = false;
+      hideMsg($('sendFailMsg')); setSendNote(null);
 
-      // 映像発信
+      // 発信前に、取得した画面ストリームのビデオトラックが生きているか確認する
+      // （終わったストリームを渡すと、相手に映像が届かないまま通話だけ進んでしまう）
+      var vtracks = localStream ? localStream.getVideoTracks() : [];
+      if (!vtracks.length || vtracks[0].readyState !== 'live') {
+        failSend('画面の取得が終わってしまっています。もう一度「接続する」を押して、共有する画面を選び直してください。');
+        return;
+      }
+
+      // 映像発信（第2引数 = getDisplayMedia で取得した画面ストリーム）
       sendCall = sendPeer.call(remoteId, localStream);
       if (!sendCall) {
         failSend('発信を開始できませんでした。最初からやり直してください。');
@@ -851,6 +911,7 @@
           state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
         }, {
           onConnected: function(){
+            sendIceConnected = true;
             $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。';
             showMsg($('sendMsg'), 'ok', '接続しました。');
             applySenderParams();
@@ -859,26 +920,65 @@
             sendStatsTimer = startStats(pc, {
               route: $('sendRoute'), fps: $('sendFps'), rtt: $('sendRtt'), res: $('sendRes')
             }, false);
+            // 補助接続（位置の共有）は映像のICEが確立してから後追いで開く。
+            // 同時に開くと、映像側と中継（TURN）の割当を取り合って
+            // 映像の通り道の確立を邪魔することがあるため。
+            openSendDataConn(remoteId);
+          },
+          onDisconnected: function(){
+            if (sending && sendIceConnected) {
+              $('sendStatus').textContent = '接続が一時的に途切れました。自動で回復を待っています…';
+            }
+          },
+          onRecovered: function(){
+            if (sending && sendIceConnected) {
+              $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。';
+            }
           },
           onFailed: function(diagText){
-            failSend('映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+            sendIceFailed = true;
+            // 診断は専用欄に出す（後続のエラーや終了メッセージで上書きされない）
+            showMsg($('sendFailMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+            failSend('映像の通り道（ICE）を確立できませんでした。くわしい診断は「送信中の画面」の下に残してあります。');
           }
         });
       });
     });
 
     sendPeer.on('error', function(err){
-      if (err && err.type === 'peer-unavailable') {
+      if (err && err.type === 'peer-unavailable' && !sendIceConnected && !sendIceFailed) {
         failSend('コード「' + code + '」のiPadが見つかりませんでした。iPad側で「iPadで映す」を開いてコードが表示されていること、数字が一致していることを確認してください。');
       } else if (!opened) {
         failSend(peerErrorText(err));
+      } else if (sendIceFailed || sendIceConnected) {
+        // PeerJS は補助接続のエラーをピア全体のエラーとしても上げることがある。
+        // 映像が確立済み／失敗診断を表示済みのときは、本バナーを上書きせず診断欄にだけ残す。
+        setSendNote('接続サーバーのエラー（' + (err && err.type ? err.type : '不明') + '）');
       } else {
         showMsg($('sendMsg'), 'error', peerErrorText(err));
       }
     });
     sendPeer.on('disconnected', function(){
+      if (sendIceFailed) { setSendNote('接続サーバーから切断されました'); return; }
       if (sending) showMsg($('sendMsg'), 'warn', '接続サーバーから切断されました。映像が止まる場合は「最初からやり直す」を押してください。');
     });
+  }
+
+  // 補助接続（位置の共有用データ接続）。映像のICE確立後にだけ開く。
+  // 失敗しても映像には一切影響させず、結果は小さな診断欄にだけ出す。
+  function openSendDataConn(remoteId){
+    if (sendConn || !sendPeer) return;
+    try {
+      sendConn = sendPeer.connect(remoteId, { reliable: true });
+      sendConn.on('open', function(){
+        setSendNote('つながっています');
+        try { sendConn.send({ type: 'pos', pos: position }); } catch (e) {}
+      });
+      sendConn.on('error', function(){ setSendNote('エラー（映像には影響しません）'); });
+      sendConn.on('close', function(){ setSendNote('閉じられました（映像には影響しません）'); });
+    } catch (e) {
+      setSendNote('開けませんでした（映像には影響しません）');
+    }
   }
 
   function failSend(text){
@@ -888,10 +988,11 @@
   }
 
   function cleanupSend(keepMessage){
+    var keepDiag = sendIceFailed; // ICE失敗時は診断バー（候補の内訳）を画面に残す
     sending = false;
     $('connectBtn').disabled = false;
     if (sendDiag) { sendDiag.stop(); sendDiag = null; }
-    $('sendDiag').classList.remove('show');
+    if (!keepDiag) $('sendDiag').classList.remove('show');
     if (sendStatsTimer) { clearInterval(sendStatsTimer); sendStatsTimer = null; }
     if (sendCall) { try { sendCall.close(); } catch (e) {} sendCall = null; }
     if (sendConn) { try { sendConn.close(); } catch (e) {} sendConn = null; }
@@ -904,7 +1005,9 @@
     $('sendEmpty').classList.remove('hide');
     $('sendStats').classList.remove('show');
     if (!keepMessage) {
-      hideMsg($('sendMsg')); hideMsg($('targetMsg'));
+      hideMsg($('sendMsg')); hideMsg($('targetMsg')); hideMsg($('sendFailMsg'));
+      setSendNote(null);
+      sendIceConnected = false; sendIceFailed = false;
       $('sendStatus').textContent = 'iPad側で表示された6桁コードを入力してください。';
     }
   }
@@ -919,7 +1022,7 @@
 
   function startReceiver(){
     if (recvPeer) return; // 既にコード発行済み
-    hideMsg($('recvMsg'));
+    hideMsg($('recvMsg')); hideMsg($('recvFailMsg')); setRecvNote(null);
     if (!peerJsReady()) {
       $('bigCode').textContent = '読み込みに失敗しました';
       $('bigCode').classList.add('waiting');
@@ -948,31 +1051,64 @@
           setPosition(data.pos, false);
         }
       });
-      conn.on('error', function(){
-        showMsg($('recvMsg'), 'warn', 'PCとの補助接続でエラーが発生しました（映像の受信には影響しない場合があります）。');
-      });
+      // 補助接続の成否は映像と無関係。本バナーには出さず、小さな診断欄にだけ残す
+      // （以前はここで本バナーを上書きし、ICE失敗の診断文が消えてしまっていた）。
+      conn.on('open', function(){ setRecvNote('つながっています'); });
+      conn.on('error', function(){ setRecvNote('エラー（映像の受信には影響しません）'); });
+      conn.on('close', function(){ setRecvNote('閉じられました（映像の受信には影響しません）'); });
     });
 
     recvPeer.on('call', function(call){
       recvCall = call;
-      hideMsg($('recvMsg'));
+      recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
+      hideMsg($('recvMsg')); hideMsg($('recvFailMsg'));
+      if (recvWatchdog) { clearTimeout(recvWatchdog); recvWatchdog = null; }
+      if (recvStatsTimer) { clearInterval(recvStatsTimer); recvStatsTimer = null; }
       $('recvStatus').textContent = 'PCから接続がありました。映像を待っています…';
-      call.answer(); // 受信側は映像を送らない
+      // 受信専用：自分からは映像を送らないため、引数なしで応答する（PeerJSの受信専用の形）
+      call.answer();
       $('recvDiag').classList.add('show');
+      var diag = null; // この通話専用の診断オブジェクト（close 時にも参照する）
       whenPeerConnection(call, function(pc){
         if (recvCall !== call) return; // 既に片付け済み
+        // Safari等で PeerJS の stream イベント後にトラックが差し替わる場合に備え、
+        // RTCPeerConnection の track イベントでも video に結び直す
+        pc.addEventListener('track', function(ev){
+          if (recvCall !== call) return;
+          var st = ev.streams && ev.streams[0];
+          if (!st) return;
+          var v = $('remoteVideo');
+          if (v.srcObject !== st) {
+            v.srcObject = st;
+            var pp = v.play(); if (pp && pp.catch) pp.catch(function(){});
+          }
+        });
         if (recvDiag) recvDiag.stop();
-        recvDiag = attachIceDiag(pc, {
+        diag = attachIceDiag(pc, {
           state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
         }, {
-          onConnected: function(){ /* 接続表示は stream イベント側で行う */ },
+          onConnected: function(){ recvIceConnected = true; /* 接続表示は stream イベント側で行う */ },
+          onDisconnected: function(){
+            if (recvStreamSeen && !recvIceFailed) {
+              $('recvStatus').textContent = '接続が一時的に途切れました。自動で回復を待っています…';
+            }
+          },
+          onRecovered: function(){
+            if (recvStreamSeen && !recvIceFailed) {
+              $('recvStatus').innerHTML = '<strong>接続しました。</strong>';
+            }
+          },
           onFailed: function(diagText){
-            showMsg($('recvMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+            recvIceFailed = true;
+            // 診断は専用欄に出す。以後の close / 補助接続エラー / ピアエラーでは上書きしない
+            showMsg($('recvFailMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText + '\n（PC側は、iPadのコードはそのままで再接続できます）');
             $('recvStatus').textContent = '接続できませんでした。';
           }
         });
+        recvDiag = diag;
       });
       call.on('stream', function(stream){
+        recvStreamSeen = true;
         remoteStream = stream;
         var v = $('remoteVideo');
         v.srcObject = stream;
@@ -990,12 +1126,39 @@
             hud: { route: $('hudRoute'), fps: $('hudFps'), rtt: $('hudRtt'), res: $('hudRes') }
           }, true);
         }
+        // トラックは届いたのに映像フレームが来ないケースの検知（6秒たっても幅0なら診断に残す）
+        if (recvWatchdog) clearTimeout(recvWatchdog);
+        recvWatchdog = setTimeout(function(){
+          recvWatchdog = null;
+          if (recvCall !== call || recvIceFailed) return;
+          if (!$('remoteVideo').videoWidth) {
+            showMsg($('recvFailMsg'), 'error', '映像トラックは届きましたが、映像フレームが来ていません。PC側で共有が止まっていないか確認してください。PC側は、iPadのコードはそのままで再接続できます。');
+            $('recvStatus').textContent = '映像が届いていません。';
+          }
+        }, 6000);
       });
       call.on('close', function(){
+        if (recvWatchdog) { clearTimeout(recvWatchdog); recvWatchdog = null; }
+        if (recvIceFailed) {
+          // ICE失敗の診断（recvFailMsg）はここでは上書きしない。状態欄だけ更新する
+          $('recvStatus').textContent = '切断されました（診断は下の赤い表示に残っています）。';
+          return;
+        }
+        if (!recvIceConnected && !recvStreamSeen && diag) {
+          // ICEが failed になる前に通話が閉じられた場合も、その時点の候補情報から診断を残す
+          recvIceFailed = true;
+          showMsg($('recvFailMsg'), 'error', '映像が届く前に接続が閉じられました。\n' + diag.diagnoseNow() + '\n（PC側は、iPadのコードはそのままで再接続できます）');
+          $('recvStatus').textContent = '切断されました。';
+          return;
+        }
         showMsg($('recvMsg'), 'warn', 'PC側の送信が終了しました。再接続する場合は両側で「最初からやり直す」を押してください。');
         $('recvStatus').textContent = '切断されました。';
       });
       call.on('error', function(err){
+        if (recvIceFailed) { // 失敗診断がある場合は上書きせず、診断欄にだけ残す
+          setRecvNote('受信エラー（' + (err && err.type ? err.type : '不明') + '）');
+          return;
+        }
         showMsg($('recvMsg'), 'error', '受信でエラーが発生しました' + (err && err.type ? '（' + err.type + '）' : '') + '。両側で最初からやり直してください。');
       });
     });
@@ -1009,11 +1172,23 @@
         createReceiverPeer();
         return;
       }
+      if (recvCall || recvIceFailed) {
+        // 通話が来た後のピア全体エラー（補助接続由来を含む）は、
+        // 本バナーと失敗診断を上書きせず、小さな診断欄にだけ残す
+        setRecvNote('接続サーバーのエラー（' + (err && err.type ? err.type : '不明') + '）');
+        return;
+      }
       showMsg($('recvMsg'), 'error', peerErrorText(err));
       $('recvStatus').textContent = '接続の待受に失敗しました。';
     });
     recvPeer.on('disconnected', function(){
-      showMsg($('recvMsg'), 'warn', '接続サーバーから切断されました。「最初からやり直す」を押してコードを作り直してください。');
+      // シグナリングへの再接続を試みる（成功すればコードはそのまま維持される）
+      try { recvPeer.reconnect(); } catch (e) {}
+      if (recvCall || recvIceFailed) {
+        setRecvNote('接続サーバーから切断されました（再接続を試みています）');
+        return;
+      }
+      showMsg($('recvMsg'), 'warn', '接続サーバーから切断されました。再接続を試みています。直らない場合は「最初からやり直す」を押してコードを作り直してください。');
     });
   }
 
@@ -1035,6 +1210,9 @@
   function cleanupReceiver(){
     if (recvDiag) { recvDiag.stop(); recvDiag = null; }
     $('recvDiag').classList.remove('show');
+    if (recvWatchdog) { clearTimeout(recvWatchdog); recvWatchdog = null; }
+    recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
+    hideMsg($('recvFailMsg')); setRecvNote(null);
     if (recvStatsTimer) { clearInterval(recvStatsTimer); recvStatsTimer = null; }
     if (recvCall) { try { recvCall.close(); } catch (e) {} recvCall = null; }
     if (recvConn) { try { recvConn.close(); } catch (e) {} recvConn = null; }
