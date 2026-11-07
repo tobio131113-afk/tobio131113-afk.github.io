@@ -298,6 +298,8 @@
       <div class="diag-bar show" id="sendSigBar">
         <span>接続経路 <b id="sendSigMode">標準</b></span>
         <span>予備ブローカー <b id="sendMqttState">—</b></span>
+        <span>HTTPS経路 <b id="sendHttpsState">—</b></span>
+        <span>ライブラリ <b id="sendLibState">—</b></span>
       </div>
       <div class="btn-row">
         <button class="btn" id="sendResetBtn" type="button">最初からやり直す</button>
@@ -354,6 +356,8 @@
       <div class="diag-bar show" id="recvSigBar">
         <span>接続経路 <b id="recvSigMode">標準</b></span>
         <span>予備ブローカー <b id="recvMqttState">—</b></span>
+        <span>HTTPS経路 <b id="recvHttpsState">—</b></span>
+        <span>ライブラリ <b id="recvLibState">—</b></span>
       </div>
       <div class="btn-row">
         <button class="btn" id="recvResetBtn" type="button">最初からやり直す</button>
@@ -483,14 +487,23 @@
      PeerJSクラウドへ届かない回線では、公開MQTTブローカー経由で
      SDP / ICE candidate をやり取りし、生の RTCPeerConnection でつなぐ。 */
   var MQTT_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081'];
-  var sendMode = 'peerjs'; // 'peerjs' | 'mqtt'
-  var recvMode = 'peerjs';
+  var sendMode = 'peerjs'; // 'peerjs' | 'mqtt' | 'https'
+  var recvMode = 'peerjs'; // 'peerjs' | 'mqtt' | 'https'
   var sendMqttClient = null, sendMqttPc = null, sendMqttDc = null, sendMqttStarted = false;
   var sendMqttConn = null, recvMqttConn = null;
   var sendMqttOfferSent = false, sendMqttPendingCands = [];
   var recvMqttClient = null, recvMqttPc = null, recvMqttDc = null, recvMqttStarted = false;
   var recvHelloTimer = null, recvMqttPendingCands = [], recvMqttRemoteSet = false;
   var sendMqttTopics = null, recvMqttTopics = null, recvMqttStandby = false;
+  /* ---- 第3経路（HTTPSのみ・ntfy.sh）用の状態 ----
+     WebSocket が両方とも通らない回線向け。購読は EventSource (GET /sse)、
+     発行は fetch POST のみで、WebSocket を一切使わない。 */
+  var sendHttpsES = null, sendHttpsPc = null, sendHttpsDc = null, sendHttpsStarted = false;
+  var sendHttpsOfferSent = false, sendHttpsPendingCands = [], sendHttpsTopics = null;
+  var sendHttpsHelloTimer = null, sendHttpsFailTimer = null, sendHttpsOpened = false;
+  var recvHttpsES = null, recvHttpsPc = null, recvHttpsDc = null, recvHttpsStarted = false;
+  var recvHttpsStandby = false, recvHttpsPendingCands = [], recvHttpsRemoteSet = false;
+  var recvHttpsHelloTimer = null, recvHttpsTopics = null, recvHttpsFailTimer = null, recvHttpsOpened = false;
 
   /* ================= DOM ================= */
   function $(id){ return document.getElementById(id); }
@@ -519,16 +532,30 @@
     $('recvNote').textContent = text;
     bar.classList.add('show');
   }
-  /* ---- 接続経路（標準／予備）と予備ブローカー接続状態の表示 ---- */
-  function setSendSig(modeText, mqttText){
+  /* ---- 接続経路（標準／予備／HTTPS）と各経路・ライブラリの状態表示 ---- */
+  function setSendSig(modeText, mqttText, httpsText){
     if (modeText !== null && modeText !== undefined) $('sendSigMode').textContent = modeText;
     if (mqttText !== null && mqttText !== undefined) $('sendMqttState').textContent = mqttText;
+    if (httpsText !== null && httpsText !== undefined) $('sendHttpsState').textContent = httpsText;
     $('sendSigBar').classList.add('show');
+    refreshLibDiag();
   }
-  function setRecvSig(modeText, mqttText){
+  function setRecvSig(modeText, mqttText, httpsText){
     if (modeText !== null && modeText !== undefined) $('recvSigMode').textContent = modeText;
     if (mqttText !== null && mqttText !== undefined) $('recvMqttState').textContent = mqttText;
+    if (httpsText !== null && httpsText !== undefined) $('recvHttpsState').textContent = httpsText;
     $('recvSigBar').classList.add('show');
+    refreshLibDiag();
+  }
+  /* CDN遮断の切り分け用: PeerJS / MQTT ライブラリの読み込み成否を診断欄に出す。
+     HTTPS経路は外部ライブラリ不要（fetch / EventSource のみ）。 */
+  function refreshLibDiag(){
+    var peerOk = (typeof window.Peer !== 'undefined');
+    var mqttOk = (typeof window.mqtt !== 'undefined' && window.mqtt && typeof window.mqtt.connect === 'function');
+    var text = 'PeerJS ' + (peerOk ? '読込OK' : '読込失敗') + ' ／ MQTT ' + (mqttOk ? '読込OK' : '読込失敗');
+    var s = $('sendLibState'), r = $('recvLibState');
+    if (s) s.textContent = text;
+    if (r) r.textContent = text;
   }
   /* トピック名には6桁コードをそのまま出さず、コードの SHA-256 ハッシュを使う
      （ipsub1/<hash>/send|recv）。 */
@@ -539,11 +566,15 @@
   }
   function mqttTopic(code, fromRole){
     var t = mqttTopicCache[code];
-    return t ? t[fromRole] : ('ipsub1/' + code + '/' + fromRole);
+    // キャッシュ未生成の間もコードをトピック名に出さない（届かない仮名を使う。
+    // 実際は prime 済みのハッシュ名が接続前にそろう）
+    return t ? t[fromRole] : ('ipsub1/unavailable/' + fromRole);
   }
   function mqttTopicsFor(code){
     if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
-      return Promise.resolve({ send: 'ipsub1/' + code + '/send', recv: 'ipsub1/' + code + '/recv' });
+      // 暗号化が使えない環境ではコードをトピック名に出さず、経路自体を使えない仮名にする
+      // （鍵も作れないため mqttPublish 側でも送信は中止される）
+      return Promise.resolve({ send: 'ipsub1/unavailable/send', recv: 'ipsub1/unavailable/recv' });
     }
     var enc = new window.TextEncoder();
     return window.crypto.subtle.digest('SHA-256', enc.encode('ipsub1-topic:' + code)).then(function(h){
@@ -552,7 +583,7 @@
       var base = 'ipsub1/' + hex.slice(0, 32);
       return { send: base + '/send', recv: base + '/recv' };
     }).catch(function(){
-      return { send: 'ipsub1/' + code + '/send', recv: 'ipsub1/' + code + '/recv' };
+      return { send: 'ipsub1/unavailable/send', recv: 'ipsub1/unavailable/recv' };
     });
   }
   /* MQTTの全メッセージは、ペアリングコード（このセッション限りの共有秘密）
@@ -658,6 +689,120 @@
     });
   }
 
+  /* =====================================================
+     第3経路（HTTPSのみ・ntfy.sh）
+     WebSocket を一切使わない: 購読は EventSource (GET https://ntfy.sh/<topic>/sse)、
+     発行は fetch POST (https://ntfy.sh/<topic>)。外部ライブラリは追加しない。
+     トピック名は予備経路と同じ考え方で、コードの SHA-256 ハッシュから生成する
+     （ntfy のトピックは1セグメントなので ipsub1-<hash32>-send / -recv の形にする。
+     コード自体はトピック名に出さない）。中身の暗号化は予備経路と同一
+     （コード由来鍵の AES-GCM、復号できないものは破棄）。
+  ===================================================== */
+  var NTFY_BASE = 'https://ntfy.sh';
+  var ntfyTopicCache = {};
+  function ntfyTopicsFor(code){
+    if (ntfyTopicCache[code]) return Promise.resolve(ntfyTopicCache[code]);
+    if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
+      // ハッシュが作れない環境では、コードをトピック名に出す経路は作らない。
+      // null を返し、呼び出し側は HTTPS 経路を開始せず診断にその旨を表示する。
+      return Promise.resolve(null);
+    }
+    var enc = new window.TextEncoder();
+    return window.crypto.subtle.digest('SHA-256', enc.encode('ipsub1-topic:' + code)).then(function(h){
+      var bytes = new Uint8Array(h), hex = '';
+      for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes[i].toString(16)).slice(-2);
+      var base = 'ipsub1-' + hex.slice(0, 32);
+      var t = { send: base + '-send', recv: base + '-recv' };
+      ntfyTopicCache[code] = t;
+      return t;
+    }).catch(function(){
+      return null; // ハッシュ生成に失敗した場合もコード入りの名前は使わない
+    });
+  }
+  function primeNtfyTopics(code){
+    if (!code) return;
+    primeMqttTopics(code);
+    ntfyTopicsFor(code).then(function(){});
+  }
+  // 暗号化エンベロープを作る（予備経路の mqttPublish と同一形式 {v,iv,data}）
+  function encryptEnvelope(code, obj){
+    return mqttKeyFor(code).then(function(key){
+      if (!key) return null;
+      var iv = window.crypto.getRandomValues(new Uint8Array(12));
+      var enc = new window.TextEncoder();
+      return window.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, enc.encode(JSON.stringify(obj))).then(function(ct){
+        return JSON.stringify({ v: 1, iv: bufferToBase64(iv), data: bufferToBase64(ct) });
+      }).catch(function(){ return null; });
+    });
+  }
+  function ntfyPostOne(topic, body){
+    return fetch(NTFY_BASE + '/' + topic, { method: 'POST', body: body }).then(function(res){
+      return !!(res && (res.ok || res.status === 200));
+    }).catch(function(){ return false; });
+  }
+  function ntfyPublish(topic, code, obj){
+    if (!topic) return Promise.resolve(false);
+    return encryptEnvelope(code, obj).then(function(body){
+      if (!body) return false; // 暗号化できない環境では平文を送らない
+      // ntfy.sh は1メッセージ約4KBまで。SDP（offer/answer）は暗号化＋Base64で
+      // それを超えることがあるため、大きい場合は分割して順番に送り、受信側で再結合する。
+      // 分割片自体は暗号化済みエンベロープの断片で、復号は再結合後にのみ行う。
+      if (body.length <= 2800) return ntfyPostOne(topic, body);
+      var chunkSize = 2000;
+      var total = Math.ceil(body.length / chunkSize);
+      var id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      var chain = Promise.resolve(true);
+      for (var i = 0; i < total; i++) {
+        (function(seq){
+          var piece = body.slice(seq * chunkSize, (seq + 1) * chunkSize);
+          var payload = JSON.stringify({ ch: 1, id: id, seq: seq, total: total, data: piece });
+          chain = chain.then(function(prevOk){
+            return ntfyPostOne(topic, payload).then(function(ok){ return prevOk && ok; });
+          });
+        })(i);
+      }
+      return chain;
+    });
+  }
+  var ntfyChunkStore = {};
+  /* ntfy の SSE イベント (data は ntfy の JSON で、本文は message フィールド) から
+     こちらのエンベロープ文字列を取り出して復号する。ntfy 自体の open 等の
+     制御メッセージや、復号できないものは null として破棄する。 */
+  function decryptNtfyEvent(dataText, code){
+    var envelope = dataText;
+    try {
+      var outer = JSON.parse(dataText);
+      if (outer && typeof outer.message === 'string') envelope = outer.message;
+      else if (outer && outer.event && outer.event !== 'message') return Promise.resolve(null);
+    } catch (e) { /* message フィールド形式でなければ data そのものをエンベロープとみなす */ }
+    // 分割片なら再結合する（そろうまで null で破棄扱い）
+    try {
+      var chunk = JSON.parse(envelope);
+      if (chunk && chunk.ch === 1 && chunk.id && typeof chunk.seq === 'number' && chunk.total) {
+        var entry = ntfyChunkStore[chunk.id];
+        if (!entry) { entry = { parts: [], got: 0, total: chunk.total, at: Date.now() }; ntfyChunkStore[chunk.id] = entry; }
+        if (!entry.parts[chunk.seq]) { entry.parts[chunk.seq] = chunk.data; entry.got++; }
+        entry.at = Date.now();
+        // 古い未完成の断片は掃除する
+        Object.keys(ntfyChunkStore).forEach(function(k){ if (Date.now() - ntfyChunkStore[k].at > 60000) delete ntfyChunkStore[k]; });
+        if (entry.got < entry.total) return Promise.resolve(null);
+        envelope = entry.parts.join('');
+        delete ntfyChunkStore[chunk.id];
+      }
+    } catch (e) { /* 分割形式でなければそのまま復号へ */ }
+    return decryptMqttPayload(envelope, code);
+  }
+  /* EventSource で1トピックを購読する。handlers: onOpen(), onError(), onEnvelope(dataText) */
+  function openNtfySubscription(topic, handlers){
+    if (typeof window.EventSource === 'undefined') { if (handlers.onError) handlers.onError(); return null; }
+    var es = null;
+    try { es = new window.EventSource(NTFY_BASE + '/' + topic + '/sse'); } catch (e) { if (handlers.onError) handlers.onError(); return null; }
+    es.onopen = function(){ if (handlers.onOpen) handlers.onOpen(); };
+    es.onerror = function(){ if (handlers.onError) handlers.onError(); };
+    es.onmessage = function(ev){ if (handlers.onEnvelope) handlers.onEnvelope(ev.data); };
+    return es;
+  }
+
   /* ================= 位置グリッド ================= */
   var posGrid = $('posGrid');
   POSITIONS.forEach(function(p){
@@ -691,6 +836,9 @@
     }
     if (notify && sendMqttDc && sendMqttDc.readyState === 'open') {
       try { sendMqttDc.send(JSON.stringify({ type: 'pos', pos: p })); } catch (e) {}
+    }
+    if (notify && sendHttpsDc && sendHttpsDc.readyState === 'open') {
+      try { sendHttpsDc.send(JSON.stringify({ type: 'pos', pos: p })); } catch (e) {}
     }
   }
   setPosition(position, false);
@@ -1008,6 +1156,7 @@
   function senderPc(){
     if (sendCall && sendCall.peerConnection) return sendCall.peerConnection;
     if (sendMqttPc) return sendMqttPc;
+    if (sendHttpsPc) return sendHttpsPc;
     return null;
   }
   function applySenderParams(){
@@ -1169,6 +1318,8 @@
   function startSendPeer(code){
     sending = true;
     primeMqttTopics(code);
+    primeNtfyTopics(code);
+    refreshLibDiag();
     $('connectBtn').disabled = true;
     sendSignalRetry = 0;
     sendCallStarted = false;
@@ -1392,7 +1543,8 @@
       onStatus: function(t){ setSendSig(null, t); },
       onBothFailed: function(reason){
         setSendSig(null, '接続できませんでした');
-        failSend('予備の接続経路も使えませんでした（' + reason + '）。標準経路（接続サーバー）にも予備ブローカーにも届いていない状態です。PCのネットワーク接続を確認して、最初からやり直してください。');
+        showMsg($('sendMsg'), 'warn', '予備の接続経路も使えませんでした（' + reason + '）。WebSocketを使わないHTTPS経路（第3経路）へ自動で切り替えます…');
+        startHttpsSender(code);
       },
       onConnect: function(client){
         sendMqttClient = client;
@@ -1480,6 +1632,151 @@
     });
   }
 
+  /* =====================================================
+     第3経路（HTTPSのみ・ntfy.sh）: 送信側
+     標準（PeerJS/WebSocket）→予備（MQTT/WebSocket）が両方とも
+     届かない場合の最終経路。EventSource で iPad→PC トピックを購読し、
+     hello を受けたら offer を fetch POST で送る。ICE設定・DataChannel
+     （位置情報）は予備経路の実装と同一（buildIceConfig を再利用）。
+  ===================================================== */
+  function teardownSendHttps(){
+    if (sendHttpsFailTimer) { clearTimeout(sendHttpsFailTimer); sendHttpsFailTimer = null; }
+    if (sendHttpsHelloTimer) { clearInterval(sendHttpsHelloTimer); sendHttpsHelloTimer = null; }
+    if (sendHttpsES) { try { sendHttpsES.close(); } catch (e) {} sendHttpsES = null; }
+    if (sendHttpsDc) { try { sendHttpsDc.close(); } catch (e) {} sendHttpsDc = null; }
+    if (sendHttpsPc) { try { sendHttpsPc.close(); } catch (e) {} sendHttpsPc = null; }
+    sendHttpsStarted = false; sendHttpsOfferSent = false; sendHttpsPendingCands = []; sendHttpsOpened = false; sendHttpsTopics = null;
+  }
+  function startHttpsSender(code){
+    if (sendHttpsStarted) return;
+    if (!localStream) { failSend('画面の取得が終わってしまっています。もう一度「接続する」を押して、共有する画面を選び直してください。'); return; }
+    // 予備経路（MQTT）は片付ける（画面ストリームは保持する）
+    teardownSendMqtt();
+    if (sendRetryTimer) { clearTimeout(sendRetryTimer); sendRetryTimer = null; }
+    if (sendDiscTimer) { clearTimeout(sendDiscTimer); sendDiscTimer = null; }
+    if (sendPeer) { try { sendPeer.destroy(); } catch (e) {} sendPeer = null; }
+    sendHttpsStarted = true;
+    sendMode = 'https';
+    setSendSig('HTTPS', null, '接続中…（ntfy.sh）');
+    sending = true;
+    $('connectBtn').disabled = true;
+    $('sendStatus').textContent = 'HTTPS経路で接続しています…iPad側の応答を待っています。';
+    showMsg($('sendMsg'), 'info', 'HTTPS経路（WebSocketを使わない経路）で接続を試みています。iPad側はHTTPS経路でも並行して待っています。少し時間がかかることがあります。');
+    ntfyTopicsFor(code).then(function(topics){
+      if (!sendHttpsStarted || sendMode !== 'https') return;
+      if (!topics) {
+        setSendSig('HTTPS', null, '使えません（暗号化が使えない環境）');
+        failSend('HTTPS経路はこの環境では使えませんでした（暗号化機能が使えないため、コードをそのまま出した経路は使いません）。標準・予備・HTTPSの全経路が使えない状態です。最新のブラウザで開いてください。');
+        return;
+      }
+      sendHttpsTopics = topics;
+      var es = openNtfySubscription(topics.recv, {
+        onOpen: function(){
+          sendHttpsOpened = true;
+          setSendSig(null, null, '接続できました（ntfy.sh）・iPadの応答待ち');
+        },
+        onError: function(){
+          if (!sendHttpsStarted) return;
+          // EventSource は自動再接続するので即失敗にはせず、診断だけ更新する
+          setSendSig(null, null, sendHttpsOpened ? '再接続中…（ntfy.sh）' : '接続できませんでした（ntfy.sh）・再試行中');
+        },
+        onEnvelope: function(dataText){
+          decryptNtfyEvent(dataText, code).then(function(msg){
+            if (!msg || !sendHttpsStarted) return;
+            if (msg.type === 'hello' && !sendHttpsOfferSent) {
+              sendHttpsOfferSent = true;
+              if (sendHttpsFailTimer) { clearTimeout(sendHttpsFailTimer); sendHttpsFailTimer = null; }
+              setSendSig(null, null, 'iPadの応答を受信・発信します');
+              createSendHttpsOffer(code);
+            } else if (msg.type === 'answer' && sendHttpsPc) {
+              sendHttpsPc.setRemoteDescription(new RTCSessionDescription(msg.sdp)).then(function(){
+                sendHttpsPendingCands.forEach(function(c){ addSendHttpsCand(c); });
+                sendHttpsPendingCands = [];
+              }).catch(function(){});
+            } else if (msg.type === 'candidate') {
+              if (sendHttpsPc && sendHttpsPc.remoteDescription) addSendHttpsCand(msg.candidate);
+              else sendHttpsPendingCands.push(msg.candidate);
+            }
+          });
+        }
+      });
+      sendHttpsES = es;
+      if (!es) {
+        failSend('HTTPS経路を使えませんでした（このブラウザでは EventSource が使えません）。標準・予備・HTTPSの全経路が使えない状態です。別のブラウザで開いてください。');
+        return;
+      }
+      // hello が一定時間来なければ、全経路失敗として確定させる
+      if (sendHttpsFailTimer) clearTimeout(sendHttpsFailTimer);
+      sendHttpsFailTimer = setTimeout(function(){
+        sendHttpsFailTimer = null;
+        if (!sendHttpsStarted || sendHttpsOfferSent || sendIceConnected) return;
+        setSendSig(null, null, 'iPadから応答なし（ntfy.sh）');
+        failSend('HTTPS経路でもiPadから応答がありませんでした。標準経路（接続サーバー）・予備ブローカー・HTTPS経路（ntfy.sh）のいずれでもつながっていない状態です。PCとiPad両方のネットワーク接続を確認して、最初からやり直してください。診断欄に各経路とライブラリ読み込みの成否が残っています。');
+      }, 35000);
+    });
+  }
+  function addSendHttpsCand(cand){
+    if (!sendHttpsPc || !cand) return;
+    sendHttpsPc.addIceCandidate(new RTCIceCandidate(cand)).catch(function(){});
+  }
+  function createSendHttpsOffer(code){
+    buildIceConfig().then(function(iceConfig){
+      if (!sending || sendMode !== 'https' || !localStream || !sendHttpsTopics) return;
+      var pc = new RTCPeerConnection(iceConfig);
+      sendHttpsPc = pc;
+      localStream.getTracks().forEach(function(t){ pc.addTrack(t, localStream); });
+      try {
+        sendHttpsDc = pc.createDataChannel('pos');
+        sendHttpsDc.onopen = function(){
+          setSendNote('つながっています（HTTPS経路）');
+          try { sendHttpsDc.send(JSON.stringify({ type: 'pos', pos: position })); } catch (e) {}
+        };
+        sendHttpsDc.onclose = function(){ setSendNote('閉じられました（映像には影響しません）'); };
+      } catch (e) { setSendNote('開けませんでした（映像には影響しません）'); }
+      pc.onicecandidate = function(ev){
+        if (ev.candidate && sendHttpsTopics) ntfyPublish(sendHttpsTopics.send, code, { type: 'candidate', candidate: ev.candidate.toJSON() });
+      };
+      resetSendPreviewStats(); resetSendIceDiag();
+      $('sendDiag').classList.add('show');
+      if (sendDiag) sendDiag.stop();
+      sendDiag = attachIceDiag(pc, {
+        state: $('sendIceState'), local: $('sendLocalCand'), remote: $('sendRemoteCand'), pair: $('sendPair')
+      }, {
+        onConnected: function(){
+          sendIceConnected = true;
+          if (sendHttpsFailTimer) { clearTimeout(sendHttpsFailTimer); sendHttpsFailTimer = null; }
+          setSendSig('HTTPS', null, '接続できました（ntfy.sh）');
+          $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。（HTTPS経路）';
+          showMsg($('sendMsg'), 'ok', '接続しました。（HTTPS経路）');
+          applySenderParams();
+          setTimeout(applySenderParams, 800); setTimeout(applySenderParams, 3000);
+          if (sendStatsTimer) clearInterval(sendStatsTimer);
+          $('sendStats').classList.add('show');
+          sendStatsTimer = startStats(pc, { route: $('sendRoute'), fps: $('sendFps'), rtt: $('sendRtt'), res: $('sendRes') }, false);
+        },
+        onDisconnected: function(){
+          if (sending && sendIceConnected) $('sendStatus').textContent = '接続が一時的に途切れました。自動で回復を待っています…';
+        },
+        onRecovered: function(){
+          if (sending && sendIceConnected) $('sendStatus').innerHTML = '<strong>接続しました。</strong> iPadに画面が表示されています。（HTTPS経路）';
+        },
+        onFailed: function(diagText){
+          sendIceFailed = true;
+          showMsg($('sendFailMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText);
+          failSend('映像の通り道（ICE）を確立できませんでした。くわしい診断は「送信中の画面」の下に残してあります。');
+        }
+      });
+      pc.createOffer().then(function(offer){ return pc.setLocalDescription(offer); }).then(function(){
+        return ntfyPublish(sendHttpsTopics.send, code, { type: 'offer', sdp: pc.localDescription });
+      }).then(function(ok){
+        if (ok === false) setSendSig(null, null, '送信に失敗しました（ntfy.sh）・接続の確立を待っています');
+        $('sendStatus').textContent = 'HTTPS経路で発信しました。接続の確立を待っています…';
+      }).catch(function(){
+        failSend('HTTPS経路での発信に失敗しました。最初からやり直してください。');
+      });
+    });
+  }
+
   function failSend(text){
     showMsg($('sendMsg'), 'error', text);
     $('sendStatus').textContent = '接続できませんでした。';
@@ -1490,7 +1787,8 @@
     var keepDiag = sendIceFailed; // ICE失敗時は診断バー（候補の内訳）を画面に残す
     sending = false;
     teardownSendMqtt();
-    if (!keepMessage) { sendMode = 'peerjs'; setSendSig('標準', '—'); }
+    teardownSendHttps();
+    if (!keepMessage) { sendMode = 'peerjs'; setSendSig('標準', '—', '—'); }
     $('connectBtn').disabled = false;
     if (sendRetryTimer) { clearTimeout(sendRetryTimer); sendRetryTimer = null; }
     if (sendDiscTimer) { clearTimeout(sendDiscTimer); sendDiscTimer = null; }
@@ -1528,7 +1826,7 @@
   }
 
   function startReceiver(){
-    if (recvPeer || recvMqttStarted) return; // 既にコード発行済み／予備経路で待受中
+    if (recvPeer || recvMqttStarted || recvHttpsStarted) return; // 既にコード発行済み／予備・HTTPS経路で待受中
     hideMsg($('recvMsg')); hideMsg($('recvFailMsg')); setRecvNote(null);
     if (!peerJsReady()) {
       $('bigCode').textContent = '読み込みに失敗しました';
@@ -1543,6 +1841,8 @@
   function createReceiverPeer(keepCode){
     if (!keepCode) recvCode = randomCode();
     primeMqttTopics(recvCode);
+    primeNtfyTopics(recvCode);
+    refreshLibDiag();
     var myGen = ++recvGen;
     var myCode = recvCode;
     // 作り直しのたびに期限付きTURN認証情報を新しく生成してから Peer を作る
@@ -1567,8 +1867,9 @@
       $('bigCode').classList.remove('waiting');
       $('copyCodeBtn').disabled = false;
       $('recvStatus').textContent = 'PCからの接続を待っています。PC側でこのコードを入力してください。';
-      // 標準経路で待受が成立したら、予備経路でも並行して待つ（二重待受）
+      // 標準経路で待受が成立したら、予備・HTTPS経路でも並行して待つ（三重待受）
       startRecvMqttStandby();
+      startRecvHttpsStandby();
     });
 
     peer.on('connection', function(conn){
@@ -1586,8 +1887,9 @@
     });
 
     peer.on('call', function(call){
-      // 標準経路で接続が始まったら、予備待受は片付ける
+      // 標準経路で接続が始まったら、予備・HTTPS待受は片付ける
       if (recvMqttStarted && recvMode !== 'mqtt') teardownRecvMqtt();
+      if (recvHttpsStarted && recvMode !== 'https') teardownRecvHttps();
       recvCall = call;
       recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
       hideMsg($('recvMsg')); hideMsg($('recvFailMsg'));
@@ -1695,7 +1997,7 @@
     });
 
     peer.on('error', function(err){
-      if (recvMode === 'mqtt') { setRecvNote('接続サーバーのエラー（予備経路で待受中）'); return; }
+      if (recvMode === 'mqtt' || recvMode === 'https') { setRecvNote('接続サーバーのエラー（予備／HTTPS経路で待受中）'); return; }
       var rtype = err && err.type ? err.type : '';
       if ((rtype === 'network' || rtype === 'server-error') && !recvCall && !recvIceFailed) {
         // 接続サーバーへの到達自体の一時的な失敗: 行き止まりにせず、
@@ -1739,7 +2041,7 @@
       $('recvStatus').textContent = '接続の待受に失敗しました。';
     });
     peer.on('disconnected', function(){
-      if (recvMode === 'mqtt') { setRecvNote('接続サーバーから切断されました（予備経路で待受中）'); return; }
+      if (recvMode === 'mqtt' || recvMode === 'https') { setRecvNote('接続サーバーから切断されました（予備／HTTPS経路で待受中）'); return; }
       // シグナリングへの再接続をまず peer.reconnect() で試みる
       // （成功すればコードはそのまま維持される）
       try { peer.reconnect(); } catch (e) {}
@@ -1849,20 +2151,27 @@
       onStatus: function(t){ setRecvSig(null, t); },
       onBothFailed: function(reason){
         if (recvMqttStandby) {
-          // 予備待受が使えなくても標準経路の待受は続ける（バナーは出さない）
-          setRecvSig(null, '接続できませんでした（標準経路で待受中）');
+          // 予備待受が使えなくても標準・HTTPS経路の待受は続ける（バナーは出さない）
+          setRecvSig(null, '接続できませんでした（標準／HTTPSで待受中）');
           recvMqttStarted = false; recvMqttStandby = false;
           return;
         }
         setRecvSig(null, '接続できませんでした');
-        showMsg($('recvMsg'), 'error', '予備の接続経路も使えませんでした（' + reason + '）。標準経路（接続サーバー）にも予備ブローカーにも届いていない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
-        $('recvStatus').textContent = '接続できませんでした。';
+        if (recvHttpsStarted) {
+          showMsg($('recvMsg'), 'warn', '予備の接続経路は使えませんでした（' + reason + '）。HTTPS経路で待受を続けます。コードはそのまま使えます。');
+          $('recvStatus').textContent = 'HTTPS経路でPCからの接続を待っています。PC側でこのコードを入力してください。';
+          return;
+        }
+        showMsg($('recvMsg'), 'warn', '予備の接続経路は使えませんでした（' + reason + '）。HTTPS経路へ自動で切り替えます…コードはそのまま使えます。');
+        startRecvHttps(false);
       },
       onConnect: function(client){
         recvMqttClient = client;
         client.subscribe(mqttTopic(code, 'send'), function(err){
           if (err) setRecvSig(null, '受信登録に失敗しました');
         });
+        // 予備が本経路の場合も、HTTPS待受を並行して始める（三重待受の維持）
+        startRecvHttpsStandby();
         if (!recvMqttStandby) {
           showMsg($('recvMsg'), 'info', '予備の接続経路で待っています。コードはそのまま「' + code + '」です。');
         }
@@ -1879,16 +2188,17 @@
         decryptMqttPayload(payload, code).then(function(msg){
           if (!msg) return;
           if (msg.type === 'offer') {
-            // 予備経路で接続が始まったら、標準側（PeerJS待受）を片付けて予備を本経路にする
+            // 予備経路で接続が始まったら、他経路（標準・HTTPS）を片付けて予備を本経路にする
+            teardownRecvHttps();
             if (recvMqttStandby) {
               recvMqttStandby = false;
               recvMode = 'mqtt';
-              setRecvSig('予備', null);
+              setRecvSig('予備', null, '—（予備で接続）');
               recvGen++;
               if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
               if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
               if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
-            }
+            } else { recvMode = 'mqtt'; }
             handleMqttOffer(code, msg.sdp);
           }
           else if (msg.type === 'candidate') {
@@ -1990,9 +2300,230 @@
     });
   }
 
+  /* =====================================================
+     第3経路（HTTPSのみ・ntfy.sh）: 受信側
+     標準・予備と同時待受（三重待受）。EventSource で PC→iPad トピックを
+     購読し、hello を接続完了まで数秒おきに fetch POST で再送する。
+     最初に offer が届いた経路を採用し、他経路は片付ける。
+  ===================================================== */
+  function teardownRecvHttps(){
+    if (recvHttpsHelloTimer) { clearInterval(recvHttpsHelloTimer); recvHttpsHelloTimer = null; }
+    if (recvHttpsFailTimer) { clearTimeout(recvHttpsFailTimer); recvHttpsFailTimer = null; }
+    if (recvHttpsES) { try { recvHttpsES.close(); } catch (e) {} recvHttpsES = null; }
+    if (recvHttpsDc) { try { recvHttpsDc.close(); } catch (e) {} recvHttpsDc = null; }
+    if (recvHttpsPc) { try { recvHttpsPc.close(); } catch (e) {} recvHttpsPc = null; }
+    recvHttpsStarted = false; recvHttpsStandby = false; recvHttpsPendingCands = []; recvHttpsRemoteSet = false; recvHttpsOpened = false; recvHttpsTopics = null;
+  }
+  function startHttpsReceiver(){
+    if (!recvCode) return;
+    if (recvHttpsStarted) {
+      recvHttpsStandby = false;
+      recvMode = 'https';
+      setRecvSig('HTTPS', null, null);
+      if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+      if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+      recvGen++;
+      if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+      $('recvStatus').textContent = 'HTTPS経路でPCからの接続を待っています。PC側でこのコードを入力してください。';
+      return;
+    }
+    startRecvHttps(false);
+  }
+  function startRecvHttpsStandby(){
+    if (recvHttpsStarted || !recvCode) return;
+    startRecvHttps(true);
+  }
+  function startRecvHttps(standby){
+    if (recvHttpsStarted || !recvCode) return;
+    recvHttpsStarted = true;
+    recvHttpsStandby = !!standby;
+    primeNtfyTopics(recvCode);
+    if (!standby) {
+      recvMode = 'https';
+      setRecvSig('HTTPS', null, '接続中…（ntfy.sh）');
+      if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+      if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+      recvGen++;
+      if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+      $('bigCode').textContent = recvCode;
+      $('bigCode').classList.remove('waiting');
+      $('copyCodeBtn').disabled = false;
+      $('recvStatus').textContent = 'HTTPS経路でPCからの接続を待っています。PC側でこのコードを入力してください。';
+    } else {
+      setRecvSig('標準＋予備＋HTTPS待受', null, '接続中…（ntfy.sh）');
+    }
+    var code = recvCode;
+    ntfyTopicsFor(code).then(function(topics){
+      if (!recvHttpsStarted) return;
+      if (!topics) {
+        // ハッシュが作れない環境では HTTPS 経路を開始しない（コード入りのトピック名は使わない）
+        setRecvSig(null, null, '使えません（暗号化が使えない環境）');
+        recvHttpsStarted = false; recvHttpsStandby = false;
+        if (!standby) {
+          showMsg($('recvMsg'), 'error', 'HTTPS経路はこの環境では使えませんでした（暗号化機能が使えないため、コードをそのまま出した経路は使いません）。最新のブラウザで開いてください。');
+          $('recvStatus').textContent = '接続できませんでした。';
+        }
+        return;
+      }
+      recvHttpsTopics = topics;
+      var es = openNtfySubscription(topics.send, {
+        onOpen: function(){
+          recvHttpsOpened = true;
+          if (recvHttpsFailTimer) { clearTimeout(recvHttpsFailTimer); recvHttpsFailTimer = null; }
+          setRecvSig(null, null, '接続できました（ntfy.sh）');
+          // 在席通知（hello）を接続完了まで数秒おきに再送する
+          var sendHello = function(){ if (recvHttpsTopics) ntfyPublish(recvHttpsTopics.recv, code, { type: 'hello' }); };
+          sendHello();
+          if (recvHttpsHelloTimer) clearInterval(recvHttpsHelloTimer);
+          recvHttpsHelloTimer = setInterval(function(){
+            if (recvIceConnected || recvStreamSeen) { clearInterval(recvHttpsHelloTimer); recvHttpsHelloTimer = null; return; }
+            sendHello();
+          }, 3000);
+          if (!recvHttpsStandby) {
+            showMsg($('recvMsg'), 'info', 'HTTPS経路で待っています。コードはそのまま「' + code + '」です。');
+          }
+        },
+        onError: function(){
+          if (!recvHttpsStarted) return;
+          if (recvHttpsStandby) {
+            setRecvSig(null, null, '再接続中…（ntfy.sh・他経路で待受中）');
+            return;
+          }
+          setRecvSig(null, null, recvHttpsOpened ? '再接続中…（ntfy.sh）' : '接続できませんでした（ntfy.sh）・再試行中');
+        },
+        onEnvelope: function(dataText){
+          decryptNtfyEvent(dataText, code).then(function(msg){
+            if (!msg || !recvHttpsStarted) return;
+            if (msg.type === 'offer') {
+              // HTTPS経路で接続が始まったら、他経路（標準・予備）を片付けてHTTPSを本経路にする
+              teardownRecvMqtt();
+              if (recvHttpsStandby) {
+                recvHttpsStandby = false;
+                recvGen++;
+                if (recvPeer) { try { recvPeer.destroy(); } catch (e) {} recvPeer = null; }
+                if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
+                if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
+              }
+              recvMode = 'https';
+              setRecvSig('HTTPS', '—（HTTPSで接続）', '接続できました（ntfy.sh）');
+              handleHttpsOffer(code, msg.sdp);
+            } else if (msg.type === 'candidate') {
+              if (recvHttpsPc && recvHttpsRemoteSet) {
+                recvHttpsPc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(function(){});
+              } else recvHttpsPendingCands.push(msg.candidate);
+            }
+          });
+        }
+      });
+      recvHttpsES = es;
+      if (!es && !standby) {
+        showMsg($('recvMsg'), 'error', 'HTTPS経路も使えませんでした（このブラウザでは EventSource が使えません）。標準・予備・HTTPSの全経路が使えない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
+        $('recvStatus').textContent = '接続できませんでした。';
+      }
+      if (!standby && es) {
+        if (recvHttpsFailTimer) clearTimeout(recvHttpsFailTimer);
+        recvHttpsFailTimer = setTimeout(function(){
+          recvHttpsFailTimer = null;
+          if (!recvHttpsStarted || recvHttpsOpened) return;
+          setRecvSig(null, null, '接続できませんでした（ntfy.sh）');
+          showMsg($('recvMsg'), 'error', 'HTTPS経路（ntfy.sh）にも届きませんでした。標準・予備・HTTPSの全経路が使えない状態です。ネットワーク接続を確認して「最初からやり直す」を押してください。');
+          $('recvStatus').textContent = '接続できませんでした。';
+        }, 15000);
+      }
+    });
+  }
+  function handleHttpsOffer(code, sdp){
+    if (recvHttpsPc) { try { recvHttpsPc.close(); } catch (e) {} recvHttpsPc = null; }
+    recvIceConnected = false; recvIceFailed = false; recvStreamSeen = false;
+    hideMsg($('recvMsg')); hideMsg($('recvFailMsg'));
+    if (recvWatchdog) { clearTimeout(recvWatchdog); recvWatchdog = null; }
+    if (recvStatsTimer) { clearInterval(recvStatsTimer); recvStatsTimer = null; }
+    $('recvStatus').textContent = 'PCから接続がありました（HTTPS経路）。映像を待っています…';
+    buildIceConfig().then(function(iceConfig){
+      if (recvMode !== 'https' || !recvHttpsStarted) return;
+      var pc = new RTCPeerConnection(iceConfig);
+      recvHttpsPc = pc;
+      pc.onicecandidate = function(ev){
+        if (ev.candidate && recvHttpsTopics) ntfyPublish(recvHttpsTopics.recv, code, { type: 'candidate', candidate: ev.candidate.toJSON() });
+      };
+      pc.ontrack = function(ev){
+        var st = ev.streams && ev.streams[0];
+        if (!st) return;
+        recvStreamSeen = true;
+        remoteStream = st;
+        var v = $('remoteVideo');
+        if (v.srcObject !== st) { v.srcObject = st; var p = v.play(); if (p && p.catch) p.catch(function(){}); }
+        $('recvEmpty').classList.add('hide');
+        $('recvHud').classList.add('show');
+        $('recvTools').classList.add('show');
+        $('recvStatus').innerHTML = '<strong>接続しました。</strong>（HTTPS経路）';
+        requestWakeLock();
+        if (recvStatsTimer) clearInterval(recvStatsTimer);
+        $('recvStats').classList.add('show');
+        recvStatsTimer = startStats(pc, {
+          route: $('recvRoute'), fps: $('recvFps'), rtt: $('recvRtt'), res: $('recvRes'),
+          hud: { route: $('hudRoute'), fps: $('hudFps'), rtt: $('hudRtt'), res: $('hudRes') }
+        }, true);
+        if (recvWatchdog) clearTimeout(recvWatchdog);
+        recvWatchdog = setTimeout(function(){
+          recvWatchdog = null;
+          if (recvHttpsPc !== pc || recvIceFailed) return;
+          if (!$('remoteVideo').videoWidth) {
+            showMsg($('recvFailMsg'), 'error', '映像トラックは届きましたが、映像フレームが来ていません。PC側で共有が止まっていないか確認してください。PC側は、iPadのコードはそのままで再接続できます。');
+            $('recvStatus').textContent = '映像が届いていません。';
+          }
+        }, 6000);
+      };
+      pc.ondatachannel = function(ev){
+        recvHttpsDc = ev.channel;
+        recvHttpsDc.onmessage = function(e){
+          try {
+            var d = JSON.parse(e.data);
+            if (d && d.type === 'pos' && POSITIONS.indexOf(d.pos) >= 0) setPosition(d.pos, false);
+          } catch (err) {}
+        };
+        recvHttpsDc.onopen = function(){ setRecvNote('つながっています（HTTPS経路）'); };
+        recvHttpsDc.onclose = function(){ setRecvNote('閉じられました（映像の受信には影響しません）'); };
+      };
+      resetRecvPreviewStats(); resetRecvIceDiag();
+      $('recvDiag').classList.add('show');
+      if (recvDiag) recvDiag.stop();
+      var diag = attachIceDiag(pc, {
+        state: $('recvIceState'), local: $('recvLocalCand'), remote: $('recvRemoteCand'), pair: $('recvPair')
+      }, {
+        onConnected: function(){ recvIceConnected = true; if (recvHttpsHelloTimer) { clearInterval(recvHttpsHelloTimer); recvHttpsHelloTimer = null; } },
+        onDisconnected: function(){
+          if (recvStreamSeen && !recvIceFailed) $('recvStatus').textContent = '接続が一時的に途切れました。自動で回復を待っています…';
+        },
+        onRecovered: function(){
+          if (recvStreamSeen && !recvIceFailed) $('recvStatus').innerHTML = '<strong>接続しました。</strong>（HTTPS経路）';
+        },
+        onFailed: function(diagText){
+          recvIceFailed = true;
+          showMsg($('recvFailMsg'), 'error', '映像の通り道（ICE）を確立できませんでした。\n' + diagText + '\n（PC側は、iPadのコードはそのままで再接続できます）');
+          $('recvStatus').textContent = '接続できませんでした。';
+        }
+      });
+      recvDiag = diag;
+      pc.setRemoteDescription(new RTCSessionDescription(sdp)).then(function(){
+        recvHttpsRemoteSet = true;
+        recvHttpsPendingCands.forEach(function(c){ pc.addIceCandidate(new RTCIceCandidate(c)).catch(function(){}); });
+        recvHttpsPendingCands = [];
+        return pc.createAnswer();
+      }).then(function(answer){
+        return pc.setLocalDescription(answer);
+      }).then(function(){
+        if (recvHttpsTopics) return ntfyPublish(recvHttpsTopics.recv, code, { type: 'answer', sdp: pc.localDescription });
+      }).catch(function(){
+        showMsg($('recvMsg'), 'error', 'HTTPS経路での応答に失敗しました。両側で最初からやり直してください。');
+      });
+    });
+  }
+
   function cleanupReceiver(){
     teardownRecvMqtt();
-    recvMode = 'peerjs'; setRecvSig('標準', '—');
+    teardownRecvHttps();
+    recvMode = 'peerjs'; setRecvSig('標準', '—', '—');
     recvGen++; // 生成途中の Peer があれば、その結果は破棄させる
     if (recvRetryTimer) { clearTimeout(recvRetryTimer); recvRetryTimer = null; }
     if (recvDiscTimer) { clearTimeout(recvDiscTimer); recvDiscTimer = null; }
@@ -2056,6 +2587,8 @@
   });
 
   /* ================= index.html として保存 ================= */
+  refreshLibDiag();
+
   $('downloadHtml').addEventListener('click', function(ev){
     ev.preventDefault();
     var html = '<!doctype html>\n' + document.documentElement.outerHTML;
