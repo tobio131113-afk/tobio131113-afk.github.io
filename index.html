@@ -224,6 +224,7 @@
             <span class="d">画面全体を送ります</span>
           </label>
         </div>
+        <p class="hint" style="margin-top:10px">「接続する」を押すと、ブラウザの共有選択画面が出ます。ウィンドウを送る場合は、その画面で「ウィンドウ」のタブを開き、送りたいアプリのウィンドウを選んで「共有」を押してください（ここの選択は目安で、実際に送られるのはブラウザの選択画面で選んだものです）。</p>
         <div class="msg" id="targetMsg" role="alert"></div>
       </div>
 
@@ -562,7 +563,42 @@
     });
   }
 
+  // 画面キャプチャのエラー表示（種別ごとに対処を併記する）
+  function captureErrorText(err, target){
+    var name = err && err.name ? err.name : '';
+    var detail = '';
+    if (name) detail += '（' + name + (err && err.message ? ': ' + err.message : '') + '）';
+    switch (name) {
+      case 'NotAllowedError':
+        return '画面共有が許可されませんでした' + detail + '。選択画面でキャンセルしたか、許可されなかった可能性があります。「接続する」をもう一度押し、出てきた選択画面で' + (target === 'screen' ? '「画面全体」' : '「ウィンドウ」タブから送りたいアプリ') + 'を選んで「共有」を押してください。';
+      case 'NotFoundError':
+        return '共有できる画面が見つかりませんでした' + detail + '。送りたいアプリのウィンドウを開いた状態で、もう一度試してください。';
+      case 'NotReadableError':
+        return '画面を読み取れませんでした' + detail + '。OSや他のアプリが画面取得を妨げている可能性があります。他の画面共有アプリを閉じて、もう一度試してください。';
+      case 'OverconstrainedError':
+        return '指定した画質・解像度の条件に合う画面がありませんでした' + detail + '。画質を「バランス」に変えて、もう一度試してください。';
+      case 'InvalidStateError':
+        return 'このページが前面にない状態では画面共有を開始できません' + detail + '。このタブを前面にしてから「接続する」を押してください。';
+      case 'SecurityError':
+        return '安全でない接続のため画面共有がブロックされました' + detail + '。httpsのURLでこのページを開いてください。';
+      case 'AbortError':
+        return '画面の選択が中断されました' + detail + '。もう一度「接続する」を押し、選択画面で共有するものを選んでください。';
+      case 'TypeError':
+        return 'ブラウザが画面共有の呼び出しを受け付けず、選択画面が出ませんでした' + detail + '。細かい制約なしでも再試行済みです。ページを再読み込みし、「接続する」を押したらすぐに出るはずの選択画面をお待ちください。それでも出ない場合は、Chrome / Edgeを最新版にして、このページを通常のタブ（シークレットでない）で開いてお試しください。';
+      default:
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+          return 'このブラウザでは画面共有（getDisplayMedia）が使えません' + detail + '。PCのChrome / Edgeの最新版で開いてください。';
+        }
+        return '画面を取得できませんでした' + detail + '。もう一度「接続する」を押し、出てきた選択画面で共有する' + (target === 'screen' ? '画面' : 'ウィンドウ') + 'を選んでください。';
+    }
+  }
+
   $('connectBtn').addEventListener('click', function(){
+    // ★ キャプチャ先行フロー:
+    // 検証などの同期処理の直後、このクリックハンドラ内で直接 getDisplayMedia を呼ぶ。
+    // await や接続処理（Peer生成など）を挟むとブラウザの「ユーザー操作直後」という
+    // 判定（transient activation）が切れて、選択画面が出ずに落ちることがあるため、
+    // Peer接続はキャプチャ取得後に回す。
     hideMsg($('sendMsg')); hideMsg($('targetMsg'));
     if (sending) return;
 
@@ -578,7 +614,7 @@
       return;
     }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-      showMsg($('targetMsg'), 'error', 'このブラウザでは画面共有が使えません。PCのChrome / Edgeで開いてください。');
+      showMsg($('targetMsg'), 'error', 'このブラウザでは画面共有が使えません。PCのChrome / Edgeの最新版で開いてください（Safariやアプリ内ブラウザでは画面共有が使えません）。');
       return;
     }
 
@@ -586,17 +622,21 @@
     var qKey = selectedQuality();
     var q = QUALITY[qKey];
 
-    var videoConstraints = {
-      width: { max: 1920 },
-      height: { max: 1080 },
-      frameRate: { ideal: 30, min: 20, max: 30 }
-    };
-    // 対象の希望（対応ブラウザでのみ効く補助指定。選択画面自体はブラウザが表示する）
-    try { videoConstraints.displaySurface = target === 'screen' ? 'monitor' : 'window'; } catch (e) {}
+    $('sendStatus').innerHTML = 'ブラウザの選択画面を開いています…出てきた画面で' + (target === 'screen' ? '「画面全体」' : '「ウィンドウ」タブから送りたいアプリ') + 'を選んでください。';
 
-    $('sendStatus').innerHTML = '画面の選択画面を開いています…';
-    navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: false })
-    .then(function(stream){
+    // 段階的フォールバック:
+    // displaySurface や frameRate の min など、ブラウザによっては TypeError の
+    // 原因になる細かい制約は付けない。安全な制約から始め、TypeError /
+    // OverconstrainedError のときだけ一段ずつ緩めて再試行する。
+    var attempts = [
+      { video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } }, audio: false },
+      { video: { frameRate: { ideal: 30 } }, audio: false },
+      { video: true, audio: false },
+      { video: true }
+    ];
+    var attemptIndex = 0;
+
+    function onStream(stream){
       localStream = stream;
       var track = stream.getVideoTracks()[0];
       if (track) {
@@ -607,22 +647,47 @@
             $('sendStatus').textContent = '共有が停止しました。';
           }
         });
+        // 実際に選ばれた種類が手順1の目安と違う場合は知らせる（失敗にはしない）
+        try {
+          var settings = track.getSettings ? track.getSettings() : {};
+          var surface = settings.displaySurface;
+          if (surface && ((target === 'window' && surface === 'monitor') || (target === 'screen' && surface === 'window'))) {
+            showMsg($('targetMsg'), 'info', 'ブラウザの選択画面で選ばれた「' + (surface === 'monitor' ? '画面全体' : 'ウィンドウ') + '」をそのまま送ります。変えたい場合は「最初からやり直す」を押して選び直してください。');
+          }
+        } catch (e) {}
       }
       var lv = $('localVideo');
       lv.srcObject = stream;
       $('sendEmpty').classList.add('hide');
       startSendPeer(code);
-    })
-    .catch(function(err){
-      if (err && err.name === 'NotAllowedError') {
-        showMsg($('targetMsg'), 'error', '画面共有が許可されませんでした。接続するときに、共有する' + (target === 'screen' ? '画面' : 'ウィンドウ') + 'を選んで許可してください。');
-      } else if (err && err.name === 'NotFoundError') {
-        showMsg($('targetMsg'), 'error', '共有できる画面が見つかりませんでした。対象のウィンドウを開いてから、もう一度試してください。');
-      } else {
-        showMsg($('targetMsg'), 'error', '画面を取得できませんでした' + (err && err.name ? '（' + err.name + '）' : '') + '。もう一度試してください。');
+    }
+
+    function tryCapture(){
+      var opts = attempts[attemptIndex];
+      var promise;
+      try {
+        // この呼び出し自体が同期的に TypeError を投げるブラウザもあるため try で包む
+        promise = navigator.mediaDevices.getDisplayMedia(opts);
+      } catch (err) {
+        onCaptureError(err);
+        return;
       }
+      promise.then(onStream).catch(onCaptureError);
+    }
+
+    function onCaptureError(err){
+      var name = err && err.name ? err.name : '';
+      // 制約が原因の失敗だけ、一段緩めて即再試行する（その他の失敗は再試行しない）
+      if ((name === 'TypeError' || name === 'OverconstrainedError') && attemptIndex < attempts.length - 1) {
+        attemptIndex++;
+        tryCapture();
+        return;
+      }
+      showMsg($('targetMsg'), 'error', captureErrorText(err, target));
       $('sendStatus').textContent = 'iPad側で表示された6桁コードを入力してください。';
-    });
+    }
+
+    tryCapture();
   });
 
   function startSendPeer(code){
